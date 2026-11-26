@@ -1,0 +1,204 @@
+//! File loading and line indexing.
+
+use memmap2::Mmap;
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+
+enum Data {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+fn slice(d: &Data) -> &[u8] {
+    match d {
+        Data::Mapped(m) => &m[..],
+        Data::Owned(v) => v,
+    }
+}
+
+/// An immutable view of a file's bytes plus an index of line start offsets.
+pub struct Document {
+    pub name: String,
+    /// Name of the input preprocessor that produced this content, if any.
+    pub filter: Option<String>,
+    path: Option<PathBuf>,
+    data: Data,
+    /// Byte offset of the start of every line. Always contains at least `0`.
+    line_starts: Vec<usize>,
+}
+
+impl Document {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let data = load(path)?;
+        let mut d = Document {
+            name: path.display().to_string(),
+            filter: None,
+            path: Some(path.to_owned()),
+            data,
+            line_starts: vec![0],
+        };
+        d.index_from(0);
+        Ok(d)
+    }
+
+    pub fn from_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Self {
+        let mut d = Document {
+            name: name.into(),
+            filter: None,
+            path: None,
+            data: Data::Owned(bytes),
+            line_starts: vec![0],
+        };
+        d.index_from(0);
+        d
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        slice(&self.data)
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+
+    /// Returns `(start_offset, content)` for line `i`, without the line terminator.
+    pub fn line(&self, i: usize) -> (usize, &[u8]) {
+        let data = self.bytes();
+        let start = self.line_starts[i];
+        let mut end = match self.line_starts.get(i + 1) {
+            Some(&next) => next - 1,
+            None if data.last() == Some(&b'\n') => data.len() - 1,
+            None => data.len(),
+        };
+        if end > start && data[end - 1] == b'\r' {
+            end -= 1;
+        }
+        (start, &data[start..end])
+    }
+
+    pub fn line_start(&self, i: usize) -> usize {
+        self.line_starts[i]
+    }
+
+    /// Offset one past the end of line `i`, including its terminator.
+    pub fn line_end(&self, i: usize) -> usize {
+        self.line_starts.get(i + 1).copied().unwrap_or(self.len())
+    }
+
+    /// Index of the line containing byte `off`.
+    pub fn line_of_offset(&self, off: usize) -> usize {
+        self.line_starts.partition_point(|&s| s <= off).saturating_sub(1)
+    }
+
+    pub fn filtered(mut self, filter: Option<String>) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    /// True if the start of the file contains ANSI escape sequences (CSI).
+    pub fn has_ansi(&self) -> bool {
+        let d = self.bytes();
+        memchr::memmem::find(&d[..d.len().min(64 * 1024)], b"\x1b[").is_some()
+    }
+
+    /// Heuristic: a NUL byte near the start means this is binary.
+    pub fn looks_binary(&self) -> bool {
+        if self.has_ansi() {
+            return false;
+        }
+        let d = self.bytes();
+        memchr::memchr(0, &d[..d.len().min(8192)]).is_some()
+    }
+
+    /// Re-reads the file if its size changed. Returns true if anything changed.
+    pub fn reload(&mut self) -> io::Result<bool> {
+        let Some(path) = self.path.clone() else {
+            return Ok(false);
+        };
+        let new_len = std::fs::metadata(&path)?.len() as usize;
+        let old_len = self.len();
+        if new_len == old_len {
+            return Ok(false);
+        }
+        self.data = load(&path)?;
+        if self.len() > old_len {
+            // Appended: existing line starts are still valid; rescan from the last one.
+            let last = *self.line_starts.last().unwrap();
+            self.index_from(last);
+        } else {
+            self.line_starts = vec![0];
+            self.index_from(0);
+        }
+        Ok(true)
+    }
+
+    fn index_from(&mut self, start: usize) {
+        let data = slice(&self.data);
+        let len = data.len();
+        self.line_starts.extend(
+            memchr::memchr_iter(b'\n', &data[start..])
+                .map(|p| start + p + 1)
+                .filter(|&s| s < len),
+        );
+    }
+}
+
+fn load(path: &Path) -> io::Result<Data> {
+    let mut f = File::open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() || meta.len() == 0 {
+        // Pipes, devices, and empty files can't (or needn't) be mapped.
+        let mut v = Vec::new();
+        f.read_to_end(&mut v)?;
+        return Ok(Data::Owned(v));
+    }
+    // SAFETY: the mapping is read-only. If another process truncates the file
+    // while it is mapped, reads past the new end may fault; this is the same
+    // trade-off every mmap-based pager makes.
+    let m = unsafe { Mmap::map(&f)? };
+    Ok(Data::Mapped(m))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(s: &str) -> Document {
+        Document::from_bytes("t", s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn empty_file_has_one_empty_line() {
+        let d = doc("");
+        assert_eq!(d.line_count(), 1);
+        assert_eq!(d.line(0), (0, &b""[..]));
+    }
+
+    #[test]
+    fn trailing_newline_does_not_add_a_line() {
+        let d = doc("a\nb\n");
+        assert_eq!(d.line_count(), 2);
+        assert_eq!(d.line(1), (2, &b"b"[..]));
+    }
+
+    #[test]
+    fn crlf_is_stripped() {
+        let d = doc("one\r\ntwo\r\n");
+        assert_eq!(d.line(0).1, b"one");
+        assert_eq!(d.line(1).1, b"two");
+    }
+
+    #[test]
+    fn no_trailing_newline() {
+        let d = doc("a\nbc");
+        assert_eq!(d.line_count(), 2);
+        assert_eq!(d.line(1).1, b"bc");
+        assert_eq!(d.line_of_offset(3), 1);
+        assert_eq!(d.line_of_offset(1), 0);
+    }
+}

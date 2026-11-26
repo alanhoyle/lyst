@@ -201,4 +201,74 @@ mod tests {
         assert_eq!(d.line_of_offset(3), 1);
         assert_eq!(d.line_of_offset(1), 0);
     }
+
+    #[test]
+    fn line_bounds_include_terminators() {
+        let d = doc("ab\r\ncd\nef");
+        assert_eq!((d.line_start(1), d.line_end(1)), (4, 7));
+        assert_eq!(d.line_end(0), 4, "line_end includes the CRLF");
+        assert_eq!(d.line_end(2), d.len());
+        // The newline byte itself belongs to the line it ends.
+        assert_eq!(d.line_of_offset(6), 1);
+        assert_eq!(d.line_of_offset(7), 2);
+        assert_eq!(d.line_of_offset(d.len() + 10), 2);
+    }
+
+    #[test]
+    fn lone_cr_is_kept_and_empty_lines_count() {
+        let d = doc("\r\n\n\rx\n");
+        assert_eq!(d.line_count(), 3);
+        assert_eq!(d.line(0).1, b"");
+        assert_eq!(d.line(1).1, b"");
+        assert_eq!(d.line(2).1, b"\rx", "only a CR right before LF is stripped");
+    }
+
+    #[test]
+    fn binary_and_ansi_detection() {
+        assert!(!doc("plain text\n").looks_binary());
+        assert!(Document::from_bytes("t", b"ELF\0\x01\x02".to_vec()).looks_binary());
+        let colored = Document::from_bytes("t", b"\x1b[31mred\x1b[0m\0".to_vec());
+        assert!(colored.has_ansi());
+        assert!(!colored.looks_binary(), "ANSI output wins over a stray NUL");
+        // A NUL past the sniffing window doesn't count.
+        let mut late = vec![b'a'; 9000];
+        late.push(0);
+        assert!(!Document::from_bytes("t", late).looks_binary());
+    }
+
+    #[test]
+    fn reload_handles_append_truncate_and_no_change() {
+        let path = std::env::temp_dir().join(format!("lyst-doc-reload-{}.txt", std::process::id()));
+        std::fs::write(&path, "a\nb").unwrap();
+        let mut d = Document::open(&path).unwrap();
+        assert_eq!(d.line_count(), 2);
+        assert!(!d.reload().unwrap(), "same size means unchanged");
+
+        // Appending continues the unterminated last line.
+        std::fs::write(&path, "a\nbc\nd\n").unwrap();
+        assert!(d.reload().unwrap());
+        assert_eq!(d.line_count(), 3);
+        assert_eq!(d.line(1).1, b"bc");
+        assert_eq!(d.line(2).1, b"d");
+
+        // Shrinking rebuilds the index from scratch.
+        std::fs::write(&path, "z").unwrap();
+        assert!(d.reload().unwrap());
+        assert_eq!(d.line_count(), 1);
+        assert_eq!(d.line(0).1, b"z");
+
+        // In-memory documents never reload.
+        assert!(!doc("x").reload().unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_empty_file_and_missing_file() {
+        let path = std::env::temp_dir().join(format!("lyst-doc-empty-{}.txt", std::process::id()));
+        std::fs::write(&path, "").unwrap();
+        let d = Document::open(&path).unwrap();
+        assert_eq!((d.len(), d.line_count()), (0, 1));
+        let _ = std::fs::remove_file(&path);
+        assert!(Document::open(&path).is_err());
+    }
 }

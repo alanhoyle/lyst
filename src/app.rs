@@ -1326,3 +1326,89 @@ impl Painter {
         queue!(out, SetAttribute(Attribute::Reset))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts() -> Options {
+        Options {
+            wrap: false,
+            hex: false,
+            numbers: false,
+            tab: 8,
+            encoding: Encoding::Utf8,
+            follow: false,
+            classic: false,
+            regex: false,
+            highlight: HlConfig::new(false, None, None).unwrap(),
+            ansi: true,
+        }
+    }
+
+    fn app(bytes: &[u8], opts: Options) -> App {
+        let doc = Document::from_bytes("t", bytes.to_vec());
+        let mut a = App::new(vec![Source::Stdin], 0, doc, opts);
+        a.resize(80, 25);
+        a
+    }
+
+    fn numbered(n: usize) -> Vec<u8> {
+        (1..=n).map(|i| format!("line {i}\n")).collect::<String>().into_bytes()
+    }
+
+    #[test]
+    fn binary_files_open_in_hex_with_a_notice() {
+        let a = app(b"\x7fELF\0\0\x01", opts());
+        assert!(a.view.hex);
+        assert!(matches!(&a.message, Some((m, false)) if m.contains("Binary")));
+        let a = app(b"text\n", opts());
+        assert!(!a.view.hex && a.message.is_none());
+    }
+
+    #[test]
+    fn goto_line_is_one_based_and_clamped() {
+        let mut a = app(&numbered(10), opts());
+        a.goto_line(0);
+        assert_eq!(a.view.top_line, 0);
+        a.goto_line(3);
+        assert_eq!(a.view.top_line, 2);
+        a.goto_line(999);
+        assert_eq!(a.view.top_line, 9);
+    }
+
+    #[test]
+    fn startup_search_finds_and_records_history() {
+        let mut a = app(b"alpha\nbeta\ngamma\n", opts());
+        a.set_search("gam");
+        assert_eq!(a.view.cur_match, Some((11, 14)));
+        assert_eq!(a.history, ["gam"]);
+    }
+
+    #[test]
+    fn invalid_regex_reports_an_error() {
+        let mut o = opts();
+        o.regex = true;
+        let mut a = app(b"x\n", o);
+        a.set_search("(");
+        assert!(a.search.is_none());
+        assert!(matches!(a.message, Some((_, true))));
+    }
+
+    #[test]
+    fn follow_mode_starts_at_the_end() {
+        let mut o = opts();
+        o.follow = true;
+        let a = app(&numbered(1000), o);
+        assert!(a.view.top_line > 900, "top_line = {}", a.view.top_line);
+    }
+
+    #[test]
+    fn draw_renders_file_text() {
+        let mut a = app(b"hello from lyst\n", opts());
+        let mut out = Vec::new();
+        a.draw(&mut out).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("hello from lyst"));
+    }
+}

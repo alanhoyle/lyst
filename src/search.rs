@@ -100,4 +100,41 @@ mod tests {
         let s = Search::new("^b.*d$", true).unwrap();
         assert_eq!(s.forward(b"abc\r\nbird\r\n", 0), Some((5, 9)));
     }
+
+    #[test]
+    fn bad_patterns_are_errors() {
+        assert!(Search::new("", false).is_err());
+        assert!(Search::new("(unclosed", true).is_err());
+        // The same text is fine as a literal.
+        assert!(Search::new("(unclosed", false).is_ok());
+    }
+
+    #[test]
+    fn forward_at_and_past_the_end() {
+        let s = Search::new("x", false).unwrap();
+        assert_eq!(s.forward(b"abx", 2), Some((2, 3)));
+        assert_eq!(s.forward(b"abx", 3), None);
+        assert_eq!(s.forward(b"abx", 99), None);
+    }
+
+    #[test]
+    fn backward_picks_last_match_before_cursor_on_same_line() {
+        let doc = Document::from_bytes("t", b"ab ab ab\n".to_vec());
+        let s = Search::new("ab", false).unwrap();
+        assert_eq!(s.backward(&doc, 6), Some((3, 5)));
+        assert_eq!(s.backward(&doc, 7), Some((6, 8)), "a match starting before the cursor counts");
+        assert_eq!(s.backward(&doc, 1), Some((0, 2)));
+    }
+
+    #[test]
+    fn uppercase_in_regex_class_turns_off_smart_case() {
+        let s = Search::new("[A-Z]+", true).unwrap();
+        assert_eq!(s.matches_in(b"abc DEF"), vec![(4, 7)]);
+    }
+
+    #[test]
+    fn empty_regex_matches_are_not_highlighted() {
+        let s = Search::new("x*", true).unwrap();
+        assert_eq!(s.matches_in(b"axxb"), vec![(1, 3)]);
+    }
 }

@@ -590,4 +590,122 @@ mod tests {
         assert_eq!(truncate_left("/a/b/c/d", 5), "…/c/d");
         assert_eq!(truncate_left("/a", 5), "/a");
     }
+
+    #[test]
+    fn more_sizes_and_wide_truncation() {
+        assert_eq!(human_size(99_999), "99999");
+        assert_eq!(human_size(100_000), "98K");
+        assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0G");
+        assert_eq!(truncate_right("漢字漢字", 5), "漢字…");
+        assert_eq!(truncate_left("漢字漢字", 5), "…漢字");
+    }
+
+    /// A scratch directory with a subdirectory and a few files of known sizes.
+    fn fixture(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("lyst-browser-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("Zeta")).unwrap();
+        fs::write(d.join("c.rs"), vec![b'x'; 300]).unwrap();
+        fs::write(d.join("A.md"), "1").unwrap();
+        fs::write(d.join("b.txt"), vec![b'x'; 10]).unwrap();
+        fs::write(d.join(".hidden"), "").unwrap();
+        d
+    }
+
+    fn labels(b: &Browser) -> Vec<String> {
+        b.entries.iter().map(Entry::label).collect()
+    }
+
+    #[test]
+    fn sorting_and_hidden_files() {
+        let dir = fixture("sort");
+        let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
+        assert_eq!(labels(&b), ["..", "Zeta/", "A.md", "b.txt", "c.rs"]);
+        assert_eq!(b.sel, 1, "starts on the first real entry, not ..");
+
+        let order = |b: &mut Browser, sort| {
+            b.sort = sort;
+            b.refresh();
+            labels(b)
+        };
+        assert_eq!(order(&mut b, Sort::Ext), ["..", "Zeta/", "A.md", "c.rs", "b.txt"]);
+        assert_eq!(order(&mut b, Sort::Size), ["..", "Zeta/", "c.rs", "b.txt", "A.md"]);
+
+        b.sort = Sort::Name;
+        b.show_hidden = true;
+        b.refresh();
+        assert_eq!(labels(&b), ["..", "Zeta/", ".hidden", "A.md", "b.txt", "c.rs"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sort_cycles_through_all_modes() {
+        let mut s = Sort::Name;
+        let mut seen = vec![];
+        for _ in 0..4 {
+            seen.push(s.label());
+            s = s.next();
+        }
+        assert!(s == Sort::Name);
+        assert_eq!(seen, ["name", "extension", "size", "date"]);
+    }
+
+    #[test]
+    fn refresh_keeps_selection_and_file_list_skips_dirs() {
+        let dir = fixture("refresh");
+        let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
+        b.select_name("b.txt");
+        fs::write(dir.join("a0.txt"), "").unwrap();
+        b.refresh();
+        assert_eq!(b.entries[b.sel].name, "b.txt");
+
+        let (files, idx) = b.file_list();
+        let names: Vec<_> = files.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["A.md", "a0.txt", "b.txt", "c.rs"]);
+        assert_eq!(idx, 2);
+
+        b.select_path(&b.dir.join("c.rs"));
+        assert_eq!(b.entries[b.sel].name, "c.rs");
+        // A path in another directory is ignored.
+        b.select_path(Path::new("/elsewhere/A.md"));
+        assert_eq!(b.entries[b.sel].name, "c.rs");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn type_ahead_prefixes_and_cycling() {
+        let dir = std::env::temp_dir().join(format!("lyst-browser-type-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for n in ["bar", "baz", "Bob", "cat"] {
+            fs::write(dir.join(n), "").unwrap();
+        }
+        let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
+        let sel = |b: &Browser| b.entries[b.sel].name.clone();
+
+        b.type_ahead('c');
+        assert_eq!(sel(&b), "cat");
+        // Repeating a letter cycles through names that start with it, ignoring case.
+        b.typed.clear();
+        b.type_ahead('b');
+        assert_eq!(sel(&b), "bar");
+        b.type_ahead('b');
+        assert_eq!(sel(&b), "baz");
+        b.type_ahead('B');
+        assert_eq!(sel(&b), "Bob");
+        b.type_ahead('b');
+        assert_eq!(sel(&b), "bar", "wraps around");
+        // Typing a longer prefix jumps straight to it.
+        b.typed.clear();
+        for c in "baz".chars() {
+            b.type_ahead(c);
+        }
+        assert_eq!(sel(&b), "baz");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_directory_is_an_error() {
+        assert!(Browser::new(Path::new("/definitely/not/here"), false, Prefs::new(false)).is_err());
+    }
 }

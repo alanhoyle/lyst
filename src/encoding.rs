@@ -177,8 +177,8 @@ pub fn cp437(b: u8) -> char {
         for (i, c) in CP437_LOW.chars().enumerate() {
             t[i] = c;
         }
-        for i in 0x20..0x7f {
-            t[i] = i as u8 as char;
+        for (i, slot) in t.iter_mut().enumerate().take(0x7f).skip(0x20) {
+            *slot = i as u8 as char;
         }
         t[0x7f] = '⌂';
         for (i, c) in CP437_HIGH.chars().enumerate() {
@@ -420,5 +420,88 @@ mod tests {
         let c = layout(b"abcdefg", Encoding::Utf8, 8, usize::MAX, false);
         assert_eq!(wrap_rows(&c, 3), vec![(0, 3), (3, 6), (6, 7)]);
         assert_eq!(wrap_rows(&[], 3), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn wide_chars_never_split_across_rows() {
+        let c = layout("a漢b".as_bytes(), Encoding::Utf8, 8, usize::MAX, false);
+        assert_eq!(wrap_rows(&c, 2), vec![(0, 1), (1, 2), (2, 3)]);
+        // Width 0 is treated as 1 rather than looping forever.
+        assert_eq!(wrap_rows(&c, 0).len(), 3);
+    }
+
+    #[test]
+    fn encoding_cycle_and_labels() {
+        let mut e = Encoding::Utf8;
+        let mut seen = vec![];
+        for _ in 0..4 {
+            seen.push(e.label());
+            e = e.next();
+        }
+        assert_eq!(e, Encoding::Utf8);
+        assert_eq!(seen, ["UTF-8", "CP437", "Latin-1", "7-bit"]);
+    }
+
+    #[test]
+    fn single_byte_encodings() {
+        let t = |b: &[u8], e| text(&layout(b, e, 4, usize::MAX, false));
+        // CP437 shows control bytes as glyphs but still expands tabs.
+        assert_eq!(t(b"\x01\t\xb0", Encoding::Cp437), "☺   ░");
+        assert_eq!(cp437(0x7f), '⌂');
+        // Latin-1's C1 range has no glyphs.
+        assert_eq!(t(b"\x85\xa9", Encoding::Latin1), "<85>©");
+        // 7-bit turns high-bit controls into caret notation.
+        assert_eq!(t(b"\x8d", Encoding::Ascii7), "^M");
+    }
+
+    #[test]
+    fn zero_width_and_c1_unicode() {
+        // A combining accent is dropped; U+0085 (NEL) is shown in hex.
+        assert_eq!(text(&layout("e\u{301}\u{85}".as_bytes(), Encoding::Utf8, 8, usize::MAX, false)), "e<85>");
+    }
+
+    #[test]
+    fn sgr_resets_and_bright_colors() {
+        let mut s = AnsiStyle::default();
+        s.apply_sgr(b"1;2;3;4;7;91;102");
+        assert!(s.bold && s.dim && s.italic && s.underline && s.reverse);
+        assert_eq!((s.fg, s.bg), (Some(Color::AnsiValue(9)), Some(Color::AnsiValue(10))));
+        s.apply_sgr(b"22;23;24;27;39;49");
+        assert_eq!(s, AnsiStyle::default());
+        // Empty parameters mean reset, like ESC[m.
+        s.bold = true;
+        s.apply_sgr(b"");
+        assert_eq!(s, AnsiStyle::default());
+        // A truncated extended color leaves the previous color alone.
+        s.apply_sgr(b"31;38;2;1");
+        assert_eq!(s.fg, Some(Color::AnsiValue(1)));
+        // Colon-separated forms are accepted too.
+        s.apply_sgr(b"38:5:42");
+        assert_eq!(s.fg, Some(Color::AnsiValue(42)));
+    }
+
+    #[test]
+    fn unfinished_and_non_sgr_escapes() {
+        // Cursor movement is swallowed without changing the style.
+        let c = layout(b"a\x1b[2Kb", Encoding::Utf8, 8, usize::MAX, true);
+        assert_eq!(text(&c), "ab");
+        assert_eq!(c[1].ansi, AnsiStyle::default());
+        // An escape cut off at the end of the line is shown raw.
+        assert_eq!(text(&layout(b"a\x1b[31", Encoding::Utf8, 8, usize::MAX, true)), "a^[[31");
+        // An unterminated OSC is shown raw as well.
+        assert_eq!(text(&layout(b"\x1b]8;;x", Encoding::Utf8, 8, usize::MAX, true)), "^[]8;;x");
+        // OSC terminated by ESC \ is consumed.
+        assert_eq!(text(&layout(b"\x1b]0;t\x1b\\z", Encoding::Utf8, 8, usize::MAX, true)), "z");
+    }
+
+    #[test]
+    fn hex_glyphs() {
+        assert_eq!(hex_glyph(b'A', Encoding::Utf8), 'A');
+        assert_eq!(hex_glyph(0x00, Encoding::Utf8), '.');
+        assert_eq!(hex_glyph(0xe9, Encoding::Utf8), '.');
+        assert_eq!(hex_glyph(0x00, Encoding::Cp437), '.');
+        assert_eq!(hex_glyph(0x03, Encoding::Cp437), '♥');
+        assert_eq!(hex_glyph(0xc1, Encoding::Ascii7), 'A');
+        assert_eq!(hex_glyph(0x8a, Encoding::Ascii7), '.');
     }
 }

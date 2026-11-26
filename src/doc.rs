@@ -148,18 +148,28 @@ impl Document {
     }
 }
 
+/// Smallest file that gets memory-mapped. On Windows a mapped file can't be
+/// truncated or replaced by other processes (editors saving, log rotation), so
+/// only files too big to comfortably copy into memory are mapped there.
+#[cfg(windows)]
+const MAP_THRESHOLD: u64 = 64 * 1024 * 1024;
+#[cfg(not(windows))]
+const MAP_THRESHOLD: u64 = 1;
+
 fn load(path: &Path) -> io::Result<Data> {
     let mut f = File::open(path)?;
     let meta = f.metadata()?;
-    if !meta.is_file() || meta.len() == 0 {
-        // Pipes, devices, and empty files can't (or needn't) be mapped.
+    if !meta.is_file() || meta.len() < MAP_THRESHOLD {
+        // Pipes, devices, and empty files can't (or needn't) be mapped, and
+        // on Windows neither are files below the threshold.
         let mut v = Vec::new();
         f.read_to_end(&mut v)?;
         return Ok(Data::Owned(v));
     }
     // SAFETY: the mapping is read-only. If another process truncates the file
     // while it is mapped, reads past the new end may fault; this is the same
-    // trade-off every mmap-based pager makes.
+    // trade-off every mmap-based pager makes. (On Windows the OS refuses the
+    // truncation instead, which is why small files aren't mapped there.)
     let m = unsafe { Mmap::map(&f)? };
     Ok(Data::Mapped(m))
 }

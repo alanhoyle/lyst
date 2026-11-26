@@ -122,6 +122,18 @@ fn preprocessor_output_replaces_file_contents() {
     c.env("LYST_OPEN", "|tr a-z A-Z < %s").arg("--no-preprocess").arg(&f);
     assert_eq!(run(c, b"").stdout, b"shout\n");
 
+    // Table files lyst lays out itself are read directly.
+    let csv = d.join("t.csv");
+    std::fs::write(&csv, "a,b\n").unwrap();
+    let mut c = lyst();
+    c.env("LYST_OPEN", "|echo reformatted %s").arg(&csv);
+    assert_eq!(run(c, b"").stdout, b"a,b\n");
+
+    // lesspipe's "==> ..." tips are switched off.
+    let mut c = lyst();
+    c.env("LYST_OPEN", "|echo quiet=$LESSQUIET #%s").arg(&f);
+    assert_eq!(run(c, b"").stdout, b"quiet=1\n");
+
     // The `|-` form also filters standard input.
     let mut c = lyst();
     c.env("LYST_OPEN", "|-tr a-z A-Z #%s");

@@ -6,6 +6,7 @@ mod external;
 mod highlight;
 mod preprocess;
 mod search;
+mod table;
 mod ui;
 
 use app::{App, Options, Source};

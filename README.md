@@ -36,6 +36,17 @@ some-command | lyst
   Supports `|cmd %s`, `||cmd %s`, the `|-` stdin variants, and the
   replacement-file form. Works with `lesspipe` to view archives, PDFs,
   compressed files, etc. The preprocessor's name appears in the status bar
+- Table view for delimited text, on automatically for `.csv`, `.tsv`, and the
+  tab-separated bioinformatics formats VCF, BED (and bedGraph/narrowPeak),
+  GTF/GFF and SAM, including compressed ones like `calls.vcf.gz` opened through
+  a preprocessor. `D` toggles it for any file, guessing the separator (tab,
+  comma, semicolon or `|`). Columns line up and get alternating colors (`S`
+  toggles them), ←/→ move a column at a time, and the header row stays pinned
+  at the top as you scroll. Metadata lines (`##` in VCF, `@` in SAM,
+  `track`/`browser` in BED) are shown as plain text, and the `#CHROM` or
+  `#chrom` line is used as the header. Fields wider than 40 columns are cut
+  off with `…`. CSV quoting is handled within a line, but a quoted field
+  containing a line break ends the row there
 - ANSI color escapes rendered as colors when present (like `less -R`),
   e.g. `git log --color | lyst`; `C` toggles, `--no-ansi` disables
 - Opens huge files instantly (memory-mapped, line index built with `memchr`)

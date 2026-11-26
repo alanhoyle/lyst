@@ -1,0 +1,7 @@
+name,age,city,email,notes
+Ann Lee,34,"Paris, France",ann@example.com,"Says ""hi"" to everyone"
+Bartholomew Featherstonehaugh,41,Oslo,bart@example.com,A name long enough to show column widths
+Chen Wei,29,Shanghai,chen@example.com,
+Dana O'Brien,52,"Cork, Ireland",dana@example.com,"Notes with, commas, inside quotes"
+Émile Zola,62,Paris,emile@example.com,Accented characters line up too
+Fatima Al-Sayed,38,Cairo,fatima@example.com,This field is deliberately much longer than forty characters so it gets cut off with an ellipsis

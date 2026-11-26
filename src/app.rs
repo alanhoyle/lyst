@@ -4,6 +4,7 @@ use crate::doc::Document;
 use crate::encoding::{self, AnsiStyle, Cell, CellKind, Encoding};
 use crate::highlight::{self, DocHighlighter, HlConfig, Span};
 use crate::search::{Match, Search};
+use crate::table::{Format, RowKind, TCell, Table};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
@@ -39,6 +40,9 @@ DISPLAY
   S                         toggle syntax highlighting
   C                         toggle ANSI color escapes (auto-detected)
   T                         follow mode: keep reading as the file grows
+  D                         table view for CSV/TSV (on by default for .csv,
+                            .tsv, .vcf, .bed, .gtf, .gff, .sam); in it,
+                            Left/Right move by column and S toggles colors
 
 MARKS AND FILES
   m <letter>                set a mark at the top line
@@ -88,6 +92,8 @@ pub(crate) struct Theme {
     pub current: Style,
     pub select: Style,
     pub dir: Style,
+    /// Text colors cycled across table columns.
+    pub columns: [Color; 6],
 }
 
 impl Theme {
@@ -107,6 +113,7 @@ impl Theme {
             current: st(Color::Black, Color::Yellow),
             select: st(Color::Black, Color::Grey),
             dir: Style { bold: true, ..st(Color::Cyan, Color::Reset) },
+            columns: [Color::Reset, Color::DarkCyan, Color::DarkGreen, Color::DarkYellow, Color::DarkMagenta, Color::Blue],
         }
     }
 
@@ -123,6 +130,7 @@ impl Theme {
             current: st(Color::Black, Color::Yellow),
             select: st(Color::DarkBlue, Color::Grey),
             dir: Style { bold: true, ..st(Color::White, Color::DarkBlue) },
+            columns: [Color::Grey, Color::Yellow, Color::Cyan, Color::Green, Color::Magenta, Color::White],
         }
     }
 }
@@ -156,6 +164,7 @@ impl Source {
                 let (v, filter) = crate::preprocess::stdin(v)?;
                 Ok(Document::from_bytes("<stdin>", v).filtered(filter))
             }
+            Source::Path(p) if crate::table::reads_directly(&p.to_string_lossy()) => Document::open(p),
             Source::Path(p) => match crate::preprocess::file(p)? {
                 Some((bytes, filter)) => {
                     // Preprocessors such as lesspipe pass plain text through
@@ -191,16 +200,25 @@ struct View {
     hl: Option<DocHighlighter>,
     /// Interpret ANSI escape sequences as colors.
     ansi: bool,
+    /// Show delimited text as aligned columns.
+    table: Option<Table>,
 }
 
 impl View {
     fn new(doc: &Document, opts: &Options) -> Self {
-        View {
-            hex: opts.hex || doc.looks_binary(),
-            hl: DocHighlighter::detect(doc, &opts.highlight),
-            ansi: opts.ansi && doc.has_ansi(),
-            ..View::default()
-        }
+        let hex = opts.hex || doc.looks_binary();
+        let ansi = opts.ansi && doc.has_ansi();
+        // A preprocessor may have laid the table out already (lesspipe runs
+        // csvlook on .csv.gz); only add our own if the separator survived.
+        let named = Format::for_name(&doc.name)
+            .filter(|f| doc.filter.is_none() || Format::sniff(doc).is_some_and(|s| s.same_separator(f)));
+        let table = match named {
+            Some(f) if !hex => Some(Table::new(doc, f, &|b: &[u8], max| {
+                encoding::layout(b, opts.encoding, opts.tab, max, ansi)
+            })),
+            _ => None,
+        };
+        View { hex, hl: DocHighlighter::detect(doc, &opts.highlight), ansi, table, ..View::default() }
     }
 }
 
@@ -331,6 +349,35 @@ impl App {
         }
     }
 
+    /// Switches between table and plain text view.
+    fn toggle_table(&mut self) {
+        self.view.hscroll = 0;
+        if self.view.table.take().is_some() {
+            self.flash("Text view");
+            return self.normalize();
+        }
+        let Some(format) = Format::for_name(&self.doc.name).or_else(|| Format::sniff(&self.doc)) else {
+            return self.error("No columns found (looked for tab, comma, semicolon and | separators)");
+        };
+        self.view.hex = false;
+        let t = Table::new(&self.doc, format, &|b, m| self.layout(b, m));
+        self.flash(format!("Table view: {}", t.format.label));
+        self.view.table = Some(t);
+        self.normalize();
+    }
+
+    /// Scrolls the table one column left or right.
+    fn column_step(&mut self, right: bool) {
+        let Some(t) = &self.view.table else { return };
+        let starts = t.column_starts();
+        let h = self.view.hscroll;
+        self.view.hscroll = if right {
+            starts.iter().copied().find(|&x| x > h).unwrap_or(h)
+        } else {
+            starts.iter().copied().rev().find(|&x| x < h).unwrap_or(0)
+        };
+    }
+
     pub fn set_search(&mut self, pattern: &str) {
         match Search::new(pattern, self.opts.regex) {
             Ok(s) => {
@@ -369,6 +416,16 @@ impl App {
         self.doc.len().div_ceil(16).max(1)
     }
 
+    /// Whether long lines wrap. Never in table view, which scrolls by column.
+    fn wrap(&self) -> bool {
+        self.opts.wrap && self.view.table.is_none()
+    }
+
+    /// The table view's header is pinned to the top row once scrolled past.
+    fn sticky_header(&self) -> Option<usize> {
+        self.view.table.as_ref()?.header.filter(|&h| h < self.view.top_line)
+    }
+
     fn layout(&self, line: &[u8], max_cols: usize) -> Vec<Cell> {
         encoding::layout(line, self.opts.encoding, self.opts.tab, max_cols, self.view.ansi)
     }
@@ -389,8 +446,11 @@ impl App {
     /// Topmost position that still fills the screen to the end of the file.
     fn end_position(&mut self) -> (usize, usize) {
         let rows = self.text_rows();
-        if !self.opts.wrap {
-            return (self.doc.line_count().saturating_sub(rows), 0);
+        if !self.wrap() {
+            let count = self.doc.line_count();
+            // Leave room for a pinned header so the last row stays visible.
+            let pinned = self.view.table.as_ref().is_some_and(|t| t.header.is_some()) && count > rows;
+            return (count.saturating_sub(rows - usize::from(pinned && rows > 1)), 0);
         }
         let mut need = rows;
         let mut line = self.doc.line_count() - 1;
@@ -416,7 +476,7 @@ impl App {
         }
         let last = self.doc.line_count() - 1;
         self.view.top_line = self.view.top_line.min(last);
-        if !self.opts.wrap {
+        if !self.wrap() {
             self.view.top_sub = 0;
         } else {
             let rows = self.row_count(self.view.top_line);
@@ -468,7 +528,7 @@ impl App {
     fn scroll_down(&mut self, mut n: usize) {
         if self.view.hex {
             self.view.hex_top += n;
-        } else if !self.opts.wrap {
+        } else if !self.wrap() {
             self.view.top_line += n;
         } else {
             while n > 0 {
@@ -492,7 +552,7 @@ impl App {
     fn scroll_up(&mut self, mut n: usize) {
         if self.view.hex {
             self.view.hex_top = self.view.hex_top.saturating_sub(n);
-        } else if !self.opts.wrap {
+        } else if !self.wrap() {
             self.view.top_line = self.view.top_line.saturating_sub(n);
         } else {
             while n > 0 {
@@ -653,15 +713,16 @@ impl App {
         if line < self.view.top_line || line > self.view.bottom_line || (line == self.view.top_line && self.view.top_sub > 0) {
             self.jump_to_offset(off, ctx);
         }
-        if !self.opts.wrap {
+        if !self.wrap() {
             let (start, bytes) = self.doc.line(line);
             let rel = off - start;
-            let col: usize = self
-                .layout(bytes, usize::MAX)
-                .iter()
-                .take_while(|c| c.byte < rel)
-                .map(|c| c.width as usize)
-                .sum();
+            let cells: Vec<Cell> = match &self.view.table {
+                Some(t) if t.kind(line, bytes) != RowKind::Meta => {
+                    t.row_cells(bytes, &|b, m| self.layout(b, m)).into_iter().map(|c| c.cell).collect()
+                }
+                _ => self.layout(bytes, usize::MAX),
+            };
+            let col: usize = cells.iter().take_while(|c| c.byte < rel).map(|c| c.width as usize).sum();
             let w = self.text_width();
             if col < self.view.hscroll || col + 1 > self.view.hscroll + w {
                 self.view.hscroll = if col < w * 2 / 3 { 0 } else { col - w / 3 };
@@ -749,10 +810,12 @@ impl App {
             KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_down(page),
             KeyCode::Home | KeyCode::Char('g') => self.go_top(),
             KeyCode::End | KeyCode::Char('G') => self.go_end(),
-            KeyCode::Left if !self.opts.wrap && !self.view.hex => {
+            KeyCode::Left if self.view.table.is_some() && !self.view.hex => self.column_step(false),
+            KeyCode::Right if self.view.table.is_some() && !self.view.hex => self.column_step(true),
+            KeyCode::Left if !self.wrap() && !self.view.hex => {
                 self.view.hscroll = self.view.hscroll.saturating_sub(if shift { 40 } else { 8 })
             }
-            KeyCode::Right if !self.opts.wrap && !self.view.hex => self.view.hscroll += if shift { 40 } else { 8 },
+            KeyCode::Right if !self.wrap() && !self.view.hex => self.view.hscroll += if shift { 40 } else { 8 },
             KeyCode::Char('f' | 'F' | '/') => self.prompt(PromptKind::Find(Dir::Forward)),
             KeyCode::Char('\\') => self.prompt(PromptKind::Find(Dir::Backward)),
             KeyCode::Char('a' | 'A' | 'n') => self.find(self.last_dir, true),
@@ -764,6 +827,16 @@ impl App {
                 true,
             ),
             KeyCode::Char('l' | 'L' | ':') => self.prompt(PromptKind::Goto),
+            KeyCode::Char('w' | 'W') if self.view.table.is_some() && !self.view.hex => {
+                self.flash("Table view doesn't wrap: ←/→ move by column (D for text view)")
+            }
+            KeyCode::Char('d' | 'D') => self.toggle_table(),
+            KeyCode::Char('s' | 'S') if self.view.table.is_some() && !self.view.hex => {
+                let t = self.view.table.as_mut().expect("table view");
+                t.colors = !t.colors;
+                let on = t.colors;
+                self.flash(if on { "Column colors on" } else { "Column colors off" });
+            }
             KeyCode::Char('w' | 'W') => {
                 self.opts.wrap = !self.opts.wrap;
                 self.view.top_sub = 0;
@@ -851,7 +924,7 @@ impl App {
     }
 
     fn hscroll_by(&mut self, delta: isize) {
-        if !self.opts.wrap && !self.view.hex {
+        if !self.wrap() && !self.view.hex {
             self.view.hscroll = self.view.hscroll.saturating_add_signed(delta);
         }
     }
@@ -990,6 +1063,10 @@ impl App {
         match self.mode {
             Mode::Help { scroll } => self.draw_help(out, scroll)?,
             _ if self.view.hex => self.draw_hex(out)?,
+            _ if self.view.table.is_some() => {
+                self.normalize();
+                self.draw_table(out)?;
+            }
             _ => {
                 self.normalize();
                 self.draw_text(out)?;
@@ -1035,7 +1112,7 @@ impl App {
         let rows = self.text_rows();
         let gw = self.gutter_width();
         let tw = self.text_width();
-        let hscroll = if self.opts.wrap { 0 } else { self.view.hscroll };
+        let hscroll = if self.wrap() { 0 } else { self.view.hscroll };
         let mut y = 0;
         let mut line = self.view.top_line;
         let mut bottom = line;
@@ -1048,14 +1125,14 @@ impl App {
                 continue;
             }
             let (start, bytes) = self.doc.line(line);
-            let max = if self.opts.wrap { usize::MAX } else { hscroll + tw };
+            let max = if self.wrap() { usize::MAX } else { hscroll + tw };
             let cells = self.layout(bytes, max);
             let matches = self.row_matches(bytes, start);
             let spans: Vec<Span> = match &mut self.view.hl {
                 Some(h) if self.opts.highlight.enabled && !self.view.ansi => h.spans(&self.doc, line),
                 _ => Vec::new(),
             };
-            let ranges = if self.opts.wrap { encoding::wrap_rows(&cells, tw) } else { vec![(0, cells.len())] };
+            let ranges = if self.wrap() { encoding::wrap_rows(&cells, tw) } else { vec![(0, cells.len())] };
             let skip = if line == self.view.top_line { self.view.top_sub } else { 0 };
             for (ri, &(a, b)) in ranges.iter().enumerate().skip(skip) {
                 if y >= rows {
@@ -1094,6 +1171,97 @@ impl App {
         }
         self.view.bottom_line = bottom;
         Ok(())
+    }
+
+    fn draw_table(&mut self, out: &mut impl Write) -> io::Result<()> {
+        let sticky = self.sticky_header();
+        let Some(mut t) = self.view.table.take() else { return Ok(()) };
+        let rows = self.text_rows();
+        let count = self.doc.line_count();
+        let top = self.view.top_line;
+        let body = rows - usize::from(sticky.is_some() && rows > 1);
+        // Widen columns for everything about to be shown, so this frame lines up.
+        {
+            let lay = |b: &[u8], m| self.layout(b, m);
+            for i in sticky.into_iter().chain(top..(top + body).min(count)) {
+                let bytes = self.doc.line(i).1;
+                if t.kind(i, bytes) != RowKind::Meta {
+                    t.measure(bytes, &lay);
+                }
+            }
+        }
+        let mut y = 0;
+        if let Some(h) = sticky.filter(|_| rows > 1) {
+            self.draw_table_row(out, &t, h, y)?;
+            y += 1;
+        }
+        let mut line = top;
+        while y < rows {
+            if line >= count {
+                let mut p = Painter::new(self.width);
+                p.text(self.theme.gutter, "~");
+                p.finish(out, y + 1, self.theme.text)?;
+            } else {
+                self.draw_table_row(out, &t, line, y)?;
+                self.view.bottom_line = line;
+                line += 1;
+            }
+            y += 1;
+        }
+        self.view.bottom_line = self.view.bottom_line.clamp(top, line.saturating_sub(1).max(top));
+        self.view.table = Some(t);
+        Ok(())
+    }
+
+    fn draw_table_row(&self, out: &mut impl Write, t: &Table, line: usize, y: usize) -> io::Result<()> {
+        let gw = self.gutter_width();
+        let hscroll = self.view.hscroll;
+        let (start, bytes) = self.doc.line(line);
+        let matches = self.row_matches(bytes, start);
+        let kind = t.kind(line, bytes);
+        let cells: Vec<TCell> = if kind == RowKind::Meta {
+            let cells = self.layout(bytes, hscroll + self.text_width());
+            cells.into_iter().map(|cell| TCell { cell, col: None }).collect()
+        } else {
+            t.row_cells(bytes, &|b, m| self.layout(b, m))
+        };
+        let mut p = Painter::new(self.width);
+        if gw > 0 {
+            p.text(self.theme.gutter, &format!("{:>w$} ", line + 1, w = gw - 1));
+        }
+        let mut col = 0;
+        for tc in &cells {
+            let c = &tc.cell;
+            let w = c.width as usize;
+            let cstart = col;
+            col += w;
+            if col <= hscroll {
+                continue;
+            }
+            let base = match (kind, tc.col) {
+                (RowKind::Meta, _) => self.theme.hint,
+                _ if c.kind == CellKind::Special => self.theme.special,
+                (_, None) => self.theme.gutter,
+                (_, Some(k)) => {
+                    let mut s = self.theme.text;
+                    if t.colors {
+                        s.fg = self.theme.columns[k % self.theme.columns.len()];
+                    }
+                    if kind == RowKind::Header {
+                        s.bold = true;
+                        s.underline = true;
+                    }
+                    apply_ansi(s, &c.ansi)
+                }
+            };
+            let style = if tc.col.is_some() || kind == RowKind::Meta { self.style_at(&matches, c.byte, base) } else { base };
+            if cstart < hscroll {
+                p.text(style, &" ".repeat(col - hscroll));
+            } else if !p.put(style, c.ch, w) {
+                break;
+            }
+        }
+        p.finish(out, y + 1, self.theme.text)
     }
 
     fn draw_hex(&mut self, out: &mut impl Write) -> io::Result<()> {
@@ -1151,13 +1319,15 @@ impl App {
         let mut flags = vec![self.opts.encoding.label()];
         if self.view.hex {
             flags.push("HEX");
-        } else if self.opts.wrap {
+        } else if self.wrap() {
             flags.push("WRAP");
         }
         if self.opts.regex {
             flags.push("REGEX");
         }
-        if let Some(h) = &self.view.hl
+        if let Some(t) = self.view.table.as_ref().filter(|_| !self.view.hex) {
+            flags.insert(0, t.format.label);
+        } else if let Some(h) = &self.view.hl
             && self.opts.highlight.enabled
             && !self.view.hex
             && !self.view.ansi
@@ -1182,7 +1352,15 @@ impl App {
         } else {
             let count = self.doc.line_count();
             let pct = (self.view.bottom_line + 1) * 100 / count;
-            let col = if self.opts.wrap { String::new() } else { format!("Col {}  ", self.view.hscroll + 1) };
+            let col = match &self.view.table {
+                Some(t) => {
+                    let starts = t.column_starts();
+                    let k = starts.iter().filter(|&&x| x <= self.view.hscroll).count().max(1);
+                    format!("Column {k} of {}  ", starts.len())
+                }
+                None if self.wrap() => String::new(),
+                None => format!("Col {}  ", self.view.hscroll + 1),
+            };
             format!("Line {} of {count}  {col}{pct:>3}%  {} ", self.view.top_line + 1, flags.join(" "))
         };
         let mut left = format!(" {}", self.doc.name);
@@ -1241,6 +1419,10 @@ impl App {
             None if matches!(self.mode, Mode::Help { .. }) => {
                 p.text(self.theme.hint, " Up/Down/PgUp/PgDn scroll · any other key returns")
             }
+            None if self.view.table.is_some() && !self.view.hex => p.text(
+                self.theme.hint,
+                " F1 Help  F Find  L Line  ←/→ Column  S Colors  D Text view  O Open  X Exit",
+            ),
             None => p.text(
                 self.theme.hint,
                 if self.from_browser {
@@ -1439,6 +1621,136 @@ mod tests {
         let mut a = app(b"x\n", opts());
         a.on_key(key('b'));
         assert!(!a.quit && a.want_browser.is_none());
+    }
+
+    /// Draws a frame and returns the screen as text, one string per row.
+    fn screen(a: &mut App) -> Vec<String> {
+        let mut out = Vec::new();
+        a.draw(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        let mut rows = vec![String::new(); a.height];
+        let mut y = 0;
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                if let Some(r) = rows.get_mut(y) {
+                    r.push(c);
+                }
+                continue;
+            }
+            // CSI: parameters, then a final letter. MoveTo is `row;colH`, 1-based.
+            if chars.next_if_eq(&'[').is_some() {
+                let mut params = String::new();
+                while let Some(&p) = chars.peek() {
+                    chars.next();
+                    if p.is_ascii_alphabetic() {
+                        if p == 'H' {
+                            y = params.split(';').next().and_then(|r| r.parse::<usize>().ok()).unwrap_or(1) - 1;
+                        }
+                        break;
+                    }
+                    params.push(p);
+                }
+            }
+        }
+        rows.iter().map(|r| r.trim_end().to_string()).collect()
+    }
+
+    fn named(name: &str, bytes: &[u8]) -> App {
+        let mut a = App::new(vec![Source::Stdin], 0, Document::from_bytes(name, bytes.to_vec()), opts());
+        a.resize(60, 8);
+        a
+    }
+
+    #[test]
+    fn csv_files_open_as_aligned_tables() {
+        let mut a = named("people.csv", b"name,age,city\nann,3,\"Paris, FR\"\nbartholomew,41,Oslo\n");
+        let s = screen(&mut a);
+        assert_eq!(s[1], "name        │ age │ city");
+        assert_eq!(s[2], "ann         │ 3   │ Paris, FR");
+        assert_eq!(s[3], "bartholomew │ 41  │ Oslo");
+        assert!(s[0].contains("CSV"), "status: {}", s[0]);
+        assert!(s[7].contains("D Text view"), "bottom: {}", s[7]);
+    }
+
+    #[test]
+    fn vcf_metadata_is_plain_and_header_sticks_when_scrolled() {
+        let mut v = b"##fileformat=VCFv4.2\n##source=test\n#CHROM\tPOS\tREF\n".to_vec();
+        for i in 1..=20 {
+            v.extend(format!("chr1\t{}\tA\n", i * 100).bytes());
+        }
+        let mut a = named("calls.vcf", &v);
+        let s = screen(&mut a);
+        assert_eq!(s[1], "##fileformat=VCFv4.2");
+        assert_eq!(s[3], "#CHROM │ POS  │ REF");
+        a.goto_line(10);
+        let s = screen(&mut a);
+        assert_eq!(s[1], "#CHROM │ POS  │ REF", "header pinned");
+        assert_eq!(s[2], "chr1   │ 700  │ A");
+        // At the end, the last row is still visible below the pinned header.
+        a.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let s = screen(&mut a);
+        assert_eq!(s[6], "chr1   │ 2000 │ A");
+    }
+
+    #[test]
+    fn preformatted_preprocessor_output_is_left_alone() {
+        let csvlook = b"| name | age |\n| ---- | --- |\n| Ann  |  34 |\n| Dana, Jr |  52 |\n";
+        let doc = Document::from_bytes("people.csv.gz", csvlook.to_vec()).filtered(Some("lesspipe.sh".into()));
+        let a = App::new(vec![Source::Stdin], 0, doc, opts());
+        assert!(a.view.table.is_none());
+        // Plain decompressed CSV still gets the table view.
+        let doc = Document::from_bytes("people.csv.gz", b"name,age\nAnn,34\n".to_vec()).filtered(Some("lesspipe.sh".into()));
+        let a = App::new(vec![Source::Stdin], 0, doc, opts());
+        assert_eq!(a.view.table.as_ref().map(|t| t.format.label), Some("CSV"));
+    }
+
+    #[test]
+    fn d_toggles_table_view_and_sniffs_unknown_files() {
+        let mut a = named("<stdin>", b"a\tb\n1\t2\n");
+        assert!(a.view.table.is_none());
+        a.on_key(key('d'));
+        assert_eq!(a.view.table.as_ref().map(|t| t.format.label), Some("TSV"));
+        assert_eq!(screen(&mut a)[1], "a │ b");
+        a.on_key(key('D'));
+        assert!(a.view.table.is_none());
+        assert_eq!(screen(&mut a)[1], "a       b", "back to tab-expanded text");
+
+        let mut a = named("notes.txt", b"no separators here\n");
+        a.on_key(key('d'));
+        assert!(a.view.table.is_none());
+        assert!(matches!(&a.message, Some((m, true)) if m.contains("No columns")));
+    }
+
+    #[test]
+    fn arrows_move_by_column_and_search_reveals_the_column() {
+        let mut a = named("w.tsv", b"aaaaaaaaaa\tbbbbbbbbbb\tcccccccccc\tdddddddddd\tneedle\n");
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        assert!(screen(&mut a)[0].contains("Column 1 of 5"));
+        a.on_key(right);
+        assert_eq!(a.view.hscroll, 13);
+        let s = screen(&mut a);
+        assert!(s[1].starts_with("bbbbbbbbbb │"));
+        assert!(s[0].contains("Column 2 of 5"), "status: {}", s[0]);
+        a.on_key(right);
+        a.on_key(left);
+        assert_eq!(a.view.hscroll, 13);
+        a.on_key(left);
+        assert_eq!(a.view.hscroll, 0);
+        a.set_search("needle");
+        assert!(screen(&mut a)[1].contains("needle"));
+    }
+
+    #[test]
+    fn s_toggles_column_colors_and_w_is_refused_in_table_view() {
+        let mut a = named("x.csv", b"a,b\n");
+        a.on_key(key('s'));
+        assert!(!a.view.table.as_ref().unwrap().colors);
+        assert!(a.opts.highlight.enabled == opts().highlight.enabled, "syntax setting untouched");
+        a.on_key(key('w'));
+        assert!(!a.opts.wrap);
+        assert!(matches!(&a.message, Some((m, false)) if m.contains("doesn't wrap")));
     }
 
     #[test]

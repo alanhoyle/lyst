@@ -1,0 +1,4 @@
+product;price;stock
+Widget;2,50;120
+Gadget;14,99;8
+Gizmo;7,25;0

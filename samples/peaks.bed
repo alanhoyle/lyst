@@ -1,0 +1,9 @@
+track name=peaks description="Sample peaks" useScore=1
+browser position chr1:1000-50000
+#chrom	chromStart	chromEnd	name	score	strand
+chr1	1200	1850	peak_1	960	+
+chr1	4300	4920	peak_2	512	-
+chr1	10010	10600	peak_3	731	+
+chr2	500	1320	peak_4	288	.
+chr2	88000	88750	peak_5	1000	-
+chrX	15000	15400	peak_6	145	+

@@ -314,7 +314,7 @@ impl Progress {
 }
 
 fn shell(cmd: &str) -> Command {
-    if cfg!(windows) {
+    let mut c = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(cmd);
         c
@@ -322,7 +322,10 @@ fn shell(cmd: &str) -> Command {
         let mut c = Command::new("sh");
         c.arg("-c").arg(cmd);
         c
-    }
+    };
+    // lesspipe otherwise prepends "==> ..." tips about less's own keys.
+    c.env("LESSQUIET", "1");
+    c
 }
 
 /// Replaces successive `%s` with shell-quoted arguments (`%%` is a literal `%`).

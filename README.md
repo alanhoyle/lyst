@@ -3,6 +3,12 @@
 A modern, Rust take on Vernon Buerg's classic DOS file viewer **LIST**: a fast,
 read-only pager with single-key commands, a status line, hex view, and search.
 
+![lyst browsing the sample files: a CSV and a VCF in table view, a search, then Rust syntax highlighting and the hex view](demo/lyst.gif)
+
+*Recorded with [VHS](https://github.com/charmbracelet/vhs) from
+[demo/demo.tape](demo/demo.tape); rerun `vhs demo/demo.tape` after a release
+build to update it.*
+
 ``` shell
 cargo install --path .
 lyst                 # browse the current directory

@@ -1,6 +1,8 @@
 //! Directory browser shown when lyst is started without a file.
 
-use crate::app::{Painter, Theme};
+use crate::app::{Painter, Style, Theme};
+use crate::goto::DirPrompt;
+use crate::usage::Usage;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::{cursor, queue, terminal};
 use std::cmp::Ordering;
@@ -96,8 +98,17 @@ pub struct Browser {
     sort: Sort,
     show_hidden: bool,
     wide: bool,
-    typed: String,
-    last_typed: Instant,
+    /// The name prefix being typed after `/`, while jumping.
+    jump: Option<String>,
+    /// Set when the user asks to edit the selected file; the caller runs
+    /// the editor.
+    pub want_edit: Option<PathBuf>,
+    /// A binary file the user was warned about; editing it again goes ahead.
+    edit_warned: Option<PathBuf>,
+    /// The "go to directory" prompt, while open.
+    goto: Option<DirPrompt>,
+    /// Disk usage being counted (or counted) for the selected entry.
+    usage: Option<Usage>,
     /// Entry and time of the last left click, for double-click detection.
     last_click: Option<(usize, Instant)>,
     message: Option<(String, bool)>,
@@ -117,8 +128,11 @@ impl Browser {
             sort: prefs.sort,
             show_hidden: prefs.show_hidden,
             wide: prefs.wide,
-            typed: String::new(),
-            last_typed: Instant::now(),
+            jump: None,
+            usage: None,
+            goto: None,
+            want_edit: None,
+            edit_warned: None,
             last_click: None,
             message: None,
             theme: Theme::new(classic),
@@ -293,38 +307,62 @@ impl Browser {
         Action::None
     }
 
-    /// Jump to the first entry whose name starts with what has been typed.
-    /// Repeating a single letter cycles through entries starting with it.
-    fn type_ahead(&mut self, c: char) {
-        if self.last_typed.elapsed() > Duration::from_millis(1000) {
-            self.typed.clear();
-        }
-        self.last_typed = Instant::now();
-        let lc = c.to_lowercase().to_string();
-        let starts = |e: &Entry, p: &str| e.name != ".." && e.name.to_lowercase().starts_with(p);
-        let repeat = self.typed.chars().all(|t| t.to_lowercase().to_string() == lc) && !self.typed.is_empty();
-        self.typed.push(c);
-        let typed = self.typed.to_lowercase();
+    /// Selects the first entry, starting at the selection (or just after it,
+    /// for `next`) and wrapping around, whose name starts with the jump
+    /// prefix, ignoring case. Returns false if nothing matches.
+    fn jump_to(&mut self, next: bool) -> bool {
+        let Some(prefix) = self.jump.as_ref().map(|p| p.to_lowercase()) else { return false };
         let n = self.entries.len();
-        if !repeat && let Some(i) = self.entries.iter().position(|e| starts(e, &typed)) {
+        let skip = usize::from(next);
+        let found = (skip..n + skip)
+            .map(|d| (self.sel + d) % n)
+            .find(|&i| self.entries[i].name != ".." && self.entries[i].name.to_lowercase().starts_with(&prefix));
+        if let Some(i) = found {
             self.sel = i;
-            return;
         }
-        // Cycle among entries starting with this letter, after the current one.
-        if let Some(i) = (1..=n).map(|d| (self.sel + d) % n).find(|&i| starts(&self.entries[i], &lc)) {
-            self.sel = i;
+        found.is_some()
+    }
+
+    /// Handles a key while jumping; `None` means the jump ended and the key
+    /// should be handled normally.
+    fn jump_key(&mut self, k: KeyEvent) -> Option<Action> {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let prefix = self.jump.as_mut()?;
+        match k.code {
+            KeyCode::Esc => self.jump = None,
+            KeyCode::Backspace => {
+                prefix.pop();
+                self.jump_to(false);
+            }
+            KeyCode::Char('/') => {
+                self.jump_to(true);
+            }
+            KeyCode::Char(c) if !ctrl => {
+                prefix.push(c);
+                self.jump_to(false);
+            }
+            _ => {
+                self.jump = None;
+                return None;
+            }
         }
+        Some(Action::None)
     }
 
     pub fn on_key(&mut self, k: KeyEvent) -> Action {
         self.message = None;
+        let warned = self.edit_warned.take();
+        if self.goto.is_some() {
+            self.goto_key(k);
+            return Action::None;
+        }
+        if let Some(action) = self.jump_key(k) {
+            return action;
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let page = self.rows().saturating_sub(1).max(1);
         let last = self.entries.len().saturating_sub(1);
         let (_, cols) = self.grid();
-        if !matches!(k.code, KeyCode::Char(_)) || ctrl {
-            self.typed.clear();
-        }
         match k.code {
             KeyCode::Char('c') if ctrl => return Action::Quit,
             KeyCode::Char('s') if ctrl => self.cycle_sort(),
@@ -350,22 +388,149 @@ impl Browser {
                 self.refresh();
             }
             KeyCode::F(5) => self.refresh(),
-            KeyCode::Char('~') if self.typed.is_empty() => {
+            KeyCode::Char('~') => {
                 if let Some(home) = std::env::var_os("HOME") {
                     self.chdir(home.into(), None);
                 }
             }
-            // Capital O opens externally, unless it's part of a name being typed.
-            KeyCode::Char('O') if !self.typing() => self.open_external(),
-            KeyCode::Char(c) if !ctrl => self.type_ahead(c),
+            KeyCode::Char('O') => self.open_external(),
+            KeyCode::Char('/') if !ctrl => self.jump = Some(String::new()),
+            KeyCode::Char('q' | 'Q') if !ctrl => return Action::Quit,
+            KeyCode::Char('w' | 'W') if !ctrl => self.open_web(),
+            KeyCode::Char('e' | 'E' | 'v' | 'V') if !ctrl => self.request_edit(warned),
+            KeyCode::Char('j' | 'J') if !ctrl => self.goto = Some(DirPrompt::new(&self.dir, self.show_hidden)),
+            KeyCode::Char('u' | 'U') if !ctrl => {
+                if let Some(e) = self.entries.get(self.sel) {
+                    self.usage = Some(Usage::start(&e.path));
+                }
+            }
             _ => {}
         }
         Action::None
     }
 
-    /// True while a type-ahead prefix is still being entered.
-    fn typing(&self) -> bool {
-        !self.typed.is_empty() && self.last_typed.elapsed() <= Duration::from_millis(1000)
+    /// Asks the caller to run the editor on the selected file, warning first
+    /// (and needing a second press) if it doesn't look like text.
+    fn request_edit(&mut self, warned: Option<PathBuf>) {
+        let Some(e) = self.entries.get(self.sel) else { return };
+        if e.is_dir {
+            return self.error(format!("{} is a directory; pick a file to edit", e.label()));
+        }
+        let (path, label) = (e.path.clone(), e.label());
+        match crate::external::looks_binary(&path) {
+            Err(err) => self.error(format!("Can't edit {label}: {err}")),
+            Ok(true) if warned.as_ref() != Some(&path) => {
+                self.error(format!("{label} doesn't look like a text file; press E again to edit it anyway"));
+                self.edit_warned = Some(path);
+            }
+            Ok(_) => self.want_edit = Some(path),
+        }
+    }
+
+    /// After the editor exits: rereads the directory, keeping the selection.
+    pub fn edited(&mut self, path: &Path, result: io::Result<std::process::ExitStatus>) {
+        self.refresh();
+        self.select_path(path);
+        let editor = crate::external::editor();
+        match result {
+            Err(e) => self.error(format!("Can't run editor \"{editor}\": {e} (set $VISUAL or $EDITOR)")),
+            Ok(s) if !s.success() => self.error(format!("Editor \"{editor}\" exited with {s}")),
+            Ok(_) => {}
+        }
+    }
+
+    /// Handles a key in the "go to directory" prompt.
+    fn goto_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(p) = &mut self.goto else { return };
+        match k.code {
+            KeyCode::Esc => self.goto = None,
+            KeyCode::Char('c' | 'g') if ctrl => self.goto = None,
+            KeyCode::Enter => {
+                let empty = p.input.is_empty();
+                let target = p.target();
+                self.goto = None;
+                if !empty {
+                    self.go_to(target);
+                }
+            }
+            KeyCode::Tab => p.complete(),
+            KeyCode::BackTab | KeyCode::Up => p.step(-1),
+            KeyCode::Down => p.step(1),
+            KeyCode::Backspace => p.backspace(),
+            KeyCode::Char('w') if ctrl => p.delete_word(),
+            KeyCode::Char('u') if ctrl => p.clear(),
+            KeyCode::Char(c) if !ctrl => p.push(c),
+            _ => {}
+        }
+    }
+
+    /// Shows a directory, or a file's directory with the file selected.
+    fn go_to(&mut self, target: PathBuf) {
+        let path = match fs::canonicalize(&target) {
+            Ok(p) => p,
+            Err(e) => return self.error(format!("{}: {e}", target.display())),
+        };
+        if path.is_dir() {
+            self.chdir(path, None);
+        } else if let Some(dir) = path.parent() {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            self.chdir(dir.to_path_buf(), name);
+        }
+    }
+
+    /// Stops showing (and counting) disk usage once another entry is selected.
+    fn drop_stale_usage(&mut self) {
+        let selected = self.entries.get(self.sel).map(|e| &e.path);
+        if self.usage.as_ref().is_some_and(|u| Some(&u.path) != selected) {
+            self.usage = None;
+        }
+    }
+
+    /// Called when idle; true if the screen needs redrawing for disk usage
+    /// progress or its final total.
+    pub fn tick(&mut self) -> bool {
+        let Some(u) = &mut self.usage else { return false };
+        if u.reported {
+            return false;
+        }
+        u.reported = u.totals().done;
+        true
+    }
+
+    /// The bottom-bar text for the disk usage count.
+    fn usage_line(&self, u: &Usage) -> String {
+        let t = u.totals();
+        let name = self.entries.get(self.sel).map(|e| e.label()).unwrap_or_default();
+        let mut s = format!(" {name}  {} on disk", human_size(t.disk));
+        if t.dirs > 0 || t.files != 1 || !t.done {
+            let files = if t.files == 1 { "file" } else { "files" };
+            s += &format!(" ({} in {} {files}", human_size(t.bytes), t.files);
+            if t.dirs > 0 {
+                let dirs = if t.dirs == 1 { "subdirectory" } else { "subdirectories" };
+                s += &format!(", {} {dirs}", t.dirs);
+            }
+            s += ")";
+        } else {
+            s += &format!(" ({} bytes)", t.bytes);
+        }
+        if t.errors > 0 {
+            s += &format!(", {} unreadable", t.errors);
+        }
+        if !t.done {
+            s += " …";
+        }
+        s
+    }
+
+    /// Opens the selected file or directory in the default web browser.
+    fn open_web(&mut self) {
+        let Some(e) = self.entries.get(self.sel) else { return };
+        let (path, label) = (e.path.clone(), e.label());
+        match crate::external::open_in_browser(&path) {
+            Ok(()) => self.flash(format!("Opening {label} in the web browser")),
+            Err(err) => self.error(format!("Can't open {label} in a web browser: {err}")),
+        }
     }
 
     /// Opens the selected file or directory in the OS's default application.
@@ -382,6 +547,10 @@ impl Browser {
     pub fn on_mouse(&mut self, m: MouseEvent) -> Option<Action> {
         let (colw, cols) = self.grid();
         let last = self.entries.len().saturating_sub(1);
+        if self.goto.is_some() && matches!(m.kind, MouseEventKind::Down(_)) {
+            self.goto = None;
+            return Some(Action::None);
+        }
         match m.kind {
             MouseEventKind::ScrollDown => self.sel = (self.sel + 3 * cols).min(last),
             MouseEventKind::ScrollUp => self.sel = self.sel.saturating_sub(3 * cols),
@@ -401,7 +570,7 @@ impl Browser {
                     .is_some_and(|(j, t)| j == i && t.elapsed() < Duration::from_millis(400));
                 self.sel = i;
                 self.message = None;
-                self.typed.clear();
+                self.jump = None;
                 if double {
                     self.last_click = None;
                     return Some(self.activate());
@@ -412,7 +581,7 @@ impl Browser {
             _ => return None,
         }
         self.message = None;
-        self.typed.clear();
+        self.jump = None;
         Some(Action::None)
     }
 
@@ -422,6 +591,7 @@ impl Browser {
     }
 
     pub fn draw(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.drop_stale_usage();
         let rows = self.rows();
         let (colw, cols) = self.grid();
         // `top` is the first grid row shown (one entry per row in list view).
@@ -453,6 +623,9 @@ impl Browser {
             self.draw_grid(out, colw, cols)?;
         } else {
             self.draw_list(out)?;
+        }
+        if let Some(g) = &self.goto {
+            self.draw_suggestions(out, g)?;
         }
         self.draw_bottom(out)?;
         queue!(out, terminal::EndSynchronizedUpdate)?;
@@ -510,14 +683,64 @@ impl Browser {
         Ok(())
     }
 
+    /// Lists the prompt's suggestions just above the bottom bar, scrolled to
+    /// keep the highlighted one in view.
+    fn draw_suggestions(&self, out: &mut impl Write, g: &DirPrompt) -> io::Result<()> {
+        let room = self.rows().min(10);
+        if g.matches.is_empty() || room == 0 {
+            return Ok(());
+        }
+        let shown = g.matches.len().min(room);
+        let start = g.sel.map_or(0, |i| (i + 1).saturating_sub(shown));
+        let more = g.matches.len() - shown;
+        let first_y = self.height.saturating_sub(1 + shown);
+        for (k, i) in (start..start + shown).enumerate() {
+            let m = &g.matches[i];
+            // Just the last component; the input shows the rest.
+            let name = m.trim_end_matches('/').rsplit('/').next().unwrap_or(m);
+            let style = if g.sel == Some(i) { self.theme.select } else { self.theme.status };
+            let mut p = Painter::new(self.width);
+            p.text(style, &format!("  {name}/"));
+            if k == 0 && start > 0 {
+                p.text(self.theme.status, &format!("   ↑ {start} more"));
+            }
+            if k + 1 == shown && more > start {
+                p.text(self.theme.status, &format!("   ↓ {} more", more - start));
+            }
+            p.finish(out, first_y + k, self.theme.status)?;
+        }
+        Ok(())
+    }
+
     fn draw_bottom(&self, out: &mut impl Write) -> io::Result<()> {
         let y = self.height.saturating_sub(1);
         let mut p = Painter::new(self.width);
+        if let Some(g) = &self.goto {
+            let label = " Go to directory: ";
+            let hint = if g.input.is_empty() { "   Tab completes  ~ home  Esc cancels" } else { "" };
+            // Keep the end of a long path in view.
+            let room = self.width.saturating_sub(label.width() + 1);
+            let shown = truncate_left(&g.input, room);
+            p.text(Style { bold: true, ..self.theme.text }, label);
+            p.text(self.theme.text, &shown);
+            p.text(self.theme.hint, hint);
+            let cx = (label.width() + shown.width()).min(self.width.saturating_sub(1));
+            p.finish(out, y, self.theme.text)?;
+            return queue!(out, cursor::MoveTo(cx as u16, y as u16), cursor::Show);
+        }
         match &self.message {
             Some((m, err)) => p.text(if *err { self.theme.error } else { self.theme.text }, m),
-            None if !self.typed.is_empty() && self.last_typed.elapsed() < Duration::from_millis(1000) => {
-                p.text(self.theme.text, &format!(" Jump: {}", self.typed))
+            None if let Some(prefix) = &self.jump => {
+                let matched = self.entries.get(self.sel).is_some_and(|e| {
+                    e.name != ".." && e.name.to_lowercase().starts_with(&prefix.to_lowercase())
+                });
+                p.text(self.theme.text, &format!(" Jump: {prefix}"));
+                if !matched && !prefix.is_empty() {
+                    p.text(self.theme.error, "  (no match)");
+                }
+                p.text(self.theme.hint, "   / Next  Enter View  Esc Cancel");
             }
+            None if let Some(u) = &self.usage => p.text(self.theme.text, &self.usage_line(u)),
             None if self.wide => {
                 // Columns hide sizes and dates, so show them for the selection.
                 if let Some(e) = self.entries.get(self.sel) {
@@ -529,7 +752,7 @@ impl Browser {
             }
             None => p.text(
                 self.theme.hint,
-                " Enter View  O Open  ← Up  Type to jump  F2 Sort  F3 Hidden  F4 Cols  Esc Exit",
+                " Enter View  E Edit  O Open  W Web  ← Up  / Jump  J Go to  U Usage  F2 Sort  F3 Hidden  F4 Cols  Esc Exit",
             ),
         }
         p.finish(out, y, self.theme.text)
@@ -690,8 +913,8 @@ mod tests {
     }
 
     #[test]
-    fn type_ahead_prefixes_and_cycling() {
-        let dir = std::env::temp_dir().join(format!("lyst-browser-type-{}", std::process::id()));
+    fn slash_jumps_by_prefix_and_cycles() {
+        let dir = std::env::temp_dir().join(format!("lyst-browser-jump-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         for n in ["bar", "baz", "Bob", "cat"] {
@@ -699,30 +922,169 @@ mod tests {
         }
         let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
         let sel = |b: &Browser| b.entries[b.sel].name.clone();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let code = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let start = sel(&b);
 
-        b.type_ahead('c');
+        // Letters without `/` don't move the selection.
+        b.on_key(key('c'));
+        assert_eq!(sel(&b), start);
+        assert!(b.jump.is_none());
+
+        b.on_key(key('/'));
+        b.on_key(key('c'));
         assert_eq!(sel(&b), "cat");
-        // Repeating a letter cycles through names that start with it, ignoring case.
-        b.typed.clear();
-        b.type_ahead('b');
-        assert_eq!(sel(&b), "bar");
-        b.type_ahead('b');
+        // Backspace widens the prefix; matching ignores case.
+        b.on_key(code(KeyCode::Backspace));
+        b.on_key(key('B'));
+        assert_eq!(sel(&b), "bar", "wraps around to the first match");
+        b.on_key(key('a'));
+        b.on_key(key('z'));
         assert_eq!(sel(&b), "baz");
-        b.type_ahead('B');
+        // `/` again moves to the next match of the prefix.
+        b.on_key(code(KeyCode::Backspace));
+        b.on_key(code(KeyCode::Backspace));
+        b.on_key(key('/'));
         assert_eq!(sel(&b), "Bob");
-        b.type_ahead('b');
+        b.on_key(key('/'));
         assert_eq!(sel(&b), "bar", "wraps around");
-        // Typing a longer prefix jumps straight to it.
-        b.typed.clear();
-        for c in "baz".chars() {
-            b.type_ahead(c);
-        }
+        // No match leaves the selection where it was.
+        b.on_key(key('q'));
+        assert_eq!(sel(&b), "bar");
+        // Esc ends the jump; the selection stays.
+        b.on_key(code(KeyCode::Esc));
+        assert!(b.jump.is_none());
+        assert_eq!(sel(&b), "bar");
+        // An arrow ends the jump and moves as usual.
+        b.on_key(key('/'));
+        b.on_key(code(KeyCode::Down));
+        assert!(b.jump.is_none());
         assert_eq!(sel(&b), "baz");
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn capital_o_while_typing_a_name_jumps_instead_of_opening() {
+    fn j_goes_to_a_typed_directory() {
+        let dir = std::env::temp_dir().join(format!("lyst-browser-goto-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("alpha/beta")).unwrap();
+        fs::write(dir.join("alpha/beta/file.txt"), "").unwrap();
+        let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
+        b.resize(80, 12);
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let code = |c| KeyEvent::new(c, KeyModifiers::NONE);
+
+        b.on_key(key('j'));
+        for c in "al".chars() {
+            b.on_key(key(c));
+        }
+        b.on_key(code(KeyCode::Tab));
+        b.on_key(code(KeyCode::Tab));
+        assert_eq!(b.goto.as_ref().unwrap().input, "alpha/beta/");
+        let mut screen = Vec::new();
+        b.draw(&mut screen).unwrap();
+        let screen = String::from_utf8_lossy(&screen);
+        assert!(screen.contains("Go to directory: ") && screen.contains("alpha/beta/"), "{screen}");
+        b.on_key(code(KeyCode::Enter));
+        assert!(b.goto.is_none());
+        assert_eq!(b.dir, fs::canonicalize(dir.join("alpha/beta")).unwrap());
+
+        // A file goes to its directory with the file selected; `q` is typed.
+        b.on_key(key('j'));
+        for c in "../../alpha/beta/file.txt".chars() {
+            b.on_key(key(c));
+        }
+        b.on_key(code(KeyCode::Enter));
+        assert_eq!(b.entries[b.sel].name, "file.txt");
+
+        // Missing paths are an error; Esc cancels without moving.
+        let here = b.dir.clone();
+        b.on_key(key('j'));
+        b.on_key(key('q'));
+        b.on_key(code(KeyCode::Enter));
+        assert!(b.message.as_ref().is_some_and(|(_, err)| *err));
+        b.on_key(key('j'));
+        b.on_key(key('x'));
+        b.on_key(code(KeyCode::Esc));
+        assert!(b.goto.is_none());
+        assert_eq!(b.dir, here);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e_edits_files_and_warns_about_binary_ones() {
+        let dir = std::env::temp_dir().join(format!("lyst-browser-edit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("adir")).unwrap();
+        fs::write(dir.join("b.bin"), b"\0\x01\x02").unwrap();
+        fs::write(dir.join("c.txt"), "text\n").unwrap();
+        let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+
+        assert_eq!(b.entries[b.sel].name, "adir");
+        b.on_key(key('e'));
+        assert!(b.want_edit.is_none());
+        assert!(b.message.as_ref().is_some_and(|(m, err)| *err && m.contains("directory")));
+
+        b.on_key(down);
+        b.on_key(key('e'));
+        assert!(b.want_edit.is_none(), "warned first");
+        assert!(b.message.as_ref().is_some_and(|(m, _)| m.contains("doesn't look like a text file")));
+        b.on_key(key('E'));
+        assert_eq!(b.want_edit.take(), Some(b.entries[b.sel].path.clone()));
+
+        b.on_key(down);
+        b.on_key(key('v'));
+        let path = b.want_edit.take().unwrap();
+        assert!(path.ends_with("c.txt"));
+        b.edited(&path, Ok(std::process::ExitStatus::default()));
+        assert_eq!(b.entries[b.sel].name, "c.txt");
+        assert!(b.message.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn q_quits_unless_jumping() {
+        let mut b = Browser::new(Path::new("samples"), false, Prefs::new(false)).unwrap();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        b.on_key(key('/'));
+        assert!(matches!(b.on_key(key('q')), Action::None), "typed as part of a name");
+        b.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(b.on_key(key('q')), Action::Quit));
+        assert!(matches!(b.on_key(key('Q')), Action::Quit));
+    }
+
+    #[test]
+    fn u_counts_disk_usage_of_the_selection() {
+        let dir = std::env::temp_dir().join(format!("lyst-browser-du-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub/deeper")).unwrap();
+        fs::write(dir.join("sub/a"), vec![b'x'; 3000]).unwrap();
+        fs::write(dir.join("sub/deeper/b"), vec![b'x'; 2000]).unwrap();
+        fs::write(dir.join("z"), "").unwrap();
+        let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
+        b.resize(100, 10);
+        assert_eq!(b.entries[b.sel].name, "sub");
+        b.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while b.tick() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let line = b.usage_line(b.usage.as_ref().unwrap());
+        assert!(line.contains("sub/") && line.contains("in 2 files, 1 subdirectory"), "{line}");
+        assert!(!line.contains('…'), "finished: {line}");
+
+        // Moving to another entry drops the count from the bottom bar.
+        b.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        b.draw(&mut Vec::new()).unwrap();
+        assert!(b.usage.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_while_jumping_opens_and_capital_o_is_typed() {
         let dir = std::env::temp_dir().join(format!("lyst-browser-o-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -731,11 +1093,13 @@ mod tests {
         }
         let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-        b.on_key(key('f'));
-        b.on_key(key('O'));
+        for c in "/fO".chars() {
+            b.on_key(key(c));
+        }
         assert_eq!(b.entries[b.sel].name, "foo");
         assert!(b.message.is_none(), "nothing was opened: {:?}", b.message);
-        assert!(b.typing());
+        assert!(matches!(b.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::Open));
+        assert!(b.jump.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -35,8 +35,8 @@ Sleep 400ms
 Down
 Sleep 600ms
 
-# Type-ahead jumps to people.csv; Enter opens it as a table.
-Type "peo"
+# / then the start of a name jumps to people.csv; Enter opens it as a table.
+Type "/peo"
 Sleep 800ms
 Enter
 Sleep 2.5s
@@ -58,7 +58,7 @@ Sleep 1s
 # Back to the list, then a VCF: metadata as plain text, header pinned.
 Type "x"
 Sleep 800ms
-Type "var"
+Type "/var"
 Sleep 800ms
 Enter
 Sleep 2.5s
@@ -78,7 +78,7 @@ Sleep 1.8s
 # Syntax highlighting, toggled with S; H shows a hex dump.
 Type "x"
 Sleep 800ms
-Type "peaks.r"
+Type "/peaks.r"
 Sleep 800ms
 Enter
 Sleep 2.5s

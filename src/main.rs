@@ -3,10 +3,12 @@ mod browser;
 mod doc;
 mod encoding;
 mod external;
+mod goto;
 mod highlight;
 mod preprocess;
 mod search;
 mod table;
+mod usage;
 mod ui;
 
 use app::{App, Options, Source};
@@ -255,7 +257,14 @@ fn run(app: &mut Ui) -> io::Result<()> {
                 }
                 _ => continue,
             }
-            // A slow preprocessor may have swallowed a resize while we waited on it.
+            if let Some(path) = app.take_edit() {
+                // Hand the terminal to the editor, then take it back.
+                leave_terminal();
+                let result = external::edit(&path);
+                enter_terminal(app.mouse)?;
+                app.edited(&path, result);
+            }
+            // A slow preprocessor (or the editor) may have swallowed a resize.
             let now = terminal::size()?;
             if now != size {
                 size = now;

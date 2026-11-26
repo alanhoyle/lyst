@@ -33,7 +33,7 @@ SEARCHING
   Searches ignore case unless the pattern contains a capital letter.
 
 DISPLAY
-  W                         toggle line wrap
+  w                         toggle line wrap
   H                         toggle hex dump
   E                         cycle encoding: UTF-8, CP437, Latin-1, 7-bit
   #                         toggle line numbers
@@ -49,6 +49,8 @@ MARKS AND FILES
   ' <letter>                jump to a mark
   [ / ]                     previous / next file
   O                         open this file in its default application
+  W                         open this file in the default web browser
+  V                         edit this file in $VISUAL or $EDITOR, then reload
   B                         open the file browser at this file's directory
 
 MOUSE
@@ -271,6 +273,10 @@ pub struct App {
     pub quit_all: bool,
     /// Set when the user asks for the file browser: (directory, file to select).
     pub want_browser: Option<(PathBuf, Option<String>)>,
+    /// Set when the user asks to edit this file; the caller runs the editor.
+    pub want_edit: Option<PathBuf>,
+    /// A binary file the user was warned about; editing it again goes ahead.
+    edit_warned: Option<PathBuf>,
     /// Launched from the file browser, so exiting returns there.
     pub from_browser: bool,
     pub full_redraw: bool,
@@ -299,6 +305,8 @@ impl App {
             quit: false,
             quit_all: false,
             want_browser: None,
+            want_edit: None,
+            edit_warned: None,
             from_browser: false,
             full_redraw: false,
         };
@@ -350,6 +358,59 @@ impl App {
         match crate::external::open(&p) {
             Ok(()) => self.flash(format!("Opening {name} in its default application")),
             Err(e) => self.error(format!("Can't open {name}: {e}")),
+        }
+    }
+
+    /// Opens this file in the default web browser (or `$BROWSER`).
+    fn open_web(&mut self) {
+        let Some(p) = self.current_path().map(std::path::Path::to_path_buf) else {
+            return self.error("Standard input has no file to open in a web browser");
+        };
+        let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+        match crate::external::open_in_browser(&p) {
+            Ok(()) => self.flash(format!("Opening {name} in the web browser")),
+            Err(e) => self.error(format!("Can't open {name} in a web browser: {e}")),
+        }
+    }
+
+    /// Asks the caller to run the editor on this file, warning first (and
+    /// needing a second press) if it doesn't look like text.
+    fn request_edit(&mut self, warned: Option<PathBuf>) {
+        let Some(p) = self.current_path().map(std::path::Path::to_path_buf) else {
+            return self.error("Standard input has no file to edit");
+        };
+        let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+        match crate::external::looks_binary(&p) {
+            Err(e) => self.error(format!("Can't edit {name}: {e}")),
+            Ok(true) if warned.as_ref() != Some(&p) => {
+                self.error(format!("{name} doesn't look like a text file; press V again to edit it anyway"));
+                self.edit_warned = Some(p);
+            }
+            Ok(_) => self.want_edit = Some(p),
+        }
+    }
+
+    /// After the editor exits: reloads the file, keeping the place.
+    pub fn edited(&mut self, result: std::io::Result<std::process::ExitStatus>) {
+        let editor = crate::external::editor();
+        match result {
+            Err(e) => return self.error(format!("Can't run editor \"{editor}\": {e} (set $VISUAL or $EDITOR)")),
+            Ok(s) if !s.success() => self.error(format!("Editor \"{editor}\" exited with {s}")),
+            Ok(_) => {}
+        }
+        self.full_redraw = true;
+        let line = self.view.top_line + 1;
+        match self.slots[self.cur].source.load() {
+            Ok(doc) => {
+                self.view = View::new(&doc, &self.opts);
+                self.doc = doc;
+                self.invalidate_layout();
+                self.goto_line(line);
+                if self.message.is_none() {
+                    self.flash(format!("Reloaded {}", self.doc.name));
+                }
+            }
+            Err(e) => self.error(format!("{}: {e}", self.doc.name)),
         }
     }
 
@@ -769,6 +830,10 @@ impl App {
 
     pub fn on_key(&mut self, k: KeyEvent) {
         self.message = None;
+        let warned = self.edit_warned.take();
+        if matches!(k.code, KeyCode::Char('v' | 'V')) && matches!(self.mode, Mode::Normal) {
+            return self.request_edit(warned);
+        }
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Normal => self.key_normal(k),
             Mode::Help { scroll } => self.key_help(k, scroll),
@@ -831,7 +896,8 @@ impl App {
                 true,
             ),
             KeyCode::Char('l' | 'L' | ':') => self.prompt(PromptKind::Goto),
-            KeyCode::Char('w' | 'W') if self.view.table.is_some() && !self.view.hex => {
+            KeyCode::Char('W') => self.open_web(),
+            KeyCode::Char('w') if self.view.table.is_some() && !self.view.hex => {
                 self.flash("Table view doesn't wrap: ←/→ move by column (D for text view)")
             }
             KeyCode::Char('d' | 'D') => self.toggle_table(),
@@ -841,7 +907,7 @@ impl App {
                 let on = t.colors;
                 self.flash(if on { "Column colors on" } else { "Column colors off" });
             }
-            KeyCode::Char('w' | 'W') => {
+            KeyCode::Char('w') => {
                 self.opts.wrap = !self.opts.wrap;
                 self.view.top_sub = 0;
                 self.view.hscroll = 0;
@@ -1558,6 +1624,58 @@ mod tests {
 
     fn numbered(n: usize) -> Vec<u8> {
         (1..=n).map(|i| format!("line {i}\n")).collect::<String>().into_bytes()
+    }
+
+    #[test]
+    fn v_asks_to_edit_and_warns_about_binary_files() {
+        let mut a = app(b"piped\n", opts());
+        a.on_key(key('v'));
+        assert!(matches!(&a.message, Some((m, true)) if m.contains("Standard input")));
+        assert!(a.want_edit.is_none());
+
+        let dir = std::env::temp_dir().join(format!("lyst-app-edit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = dir.join("notes.txt");
+        let bin = dir.join("blob.bin");
+        std::fs::write(&text, numbered(100)).unwrap();
+        std::fs::write(&bin, b"\x7fELF\0\0\x01").unwrap();
+        let open = |p: &std::path::Path| {
+            let src = Source::Path(p.to_path_buf());
+            let doc = src.load().unwrap();
+            let mut a = App::new(vec![src], 0, doc, opts());
+            a.resize(80, 25);
+            a
+        };
+
+        let mut a = open(&text);
+        a.goto_line(40);
+        a.on_key(key('v'));
+        assert_eq!(a.want_edit.take().as_deref(), Some(text.as_path()));
+        // The "editor" changes the file; the viewer reloads it in place.
+        std::fs::write(&text, format!("new first line\n{}", String::from_utf8(numbered(100)).unwrap())).unwrap();
+        a.edited(Ok(std::process::ExitStatus::default()));
+        assert_eq!(a.doc.line_count(), 101);
+        assert_eq!(a.view.top_line, 39, "same line number");
+        assert!(matches!(&a.message, Some((m, false)) if m.contains("Reloaded")));
+
+        let mut a = open(&bin);
+        a.on_key(key('v'));
+        assert!(a.want_edit.is_none());
+        assert!(matches!(&a.message, Some((m, true)) if m.contains("doesn't look like a text file")));
+        // Pressing it again edits anyway; any other key in between resets.
+        a.on_key(key('V'));
+        assert_eq!(a.want_edit.take().as_deref(), Some(bin.as_path()));
+        a.on_key(key('v'));
+        a.on_key(key('j'));
+        a.on_key(key('v'));
+        assert!(a.want_edit.is_none());
+
+        // 'v' typed into a prompt is just text.
+        let mut a = open(&text);
+        a.on_key(key('f'));
+        a.on_key(key('v'));
+        assert!(a.want_edit.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

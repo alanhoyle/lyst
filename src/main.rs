@@ -2,6 +2,7 @@ mod app;
 mod browser;
 mod doc;
 mod encoding;
+mod external;
 mod highlight;
 mod preprocess;
 mod search;

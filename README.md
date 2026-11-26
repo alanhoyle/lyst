@@ -16,12 +16,15 @@ some-command | lyst
 - File browser like LIST's opening screen: `..`, directories, then files with
   size and date. Arrows/PgUp/PgDn/Home/End to move, Enter to view, ← or
   Backspace to go up, type letters to jump (repeat a letter to cycle),
-  `F2` sort (name/extension/size/date), `F3` dotfiles, `~` home.
+  `F2` sort (name/extension/size/date), `F3` dotfiles, `~` home,
+  `O` (capital) opens the selection in its default application.
   `F4` switches between one line per file (size and date) and a compact
   multi-column view (start in it with `--wide`); in columns, arrows move
   through the grid and Backspace goes up a directory.
   From the viewer, `X`/Esc returns to the list, `[`/`]` step through the
-  directory's files, `O` opens the browser at the current file, `Q` quits
+  directory's files, `B` opens the browser at the current file, `Q` quits
+- `O` opens the file you're viewing in the OS's default application
+  (`open` on macOS, `xdg-open` on Linux, `start` on Windows)
 - Syntax highlighting for ~200 languages (syntect with bat's syntax and theme
   collection, pure Rust, no external tools). Detected from the file name,
   extension, or shebang line; `S` toggles it. The default `ansi` theme uses

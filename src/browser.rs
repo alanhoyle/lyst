@@ -355,10 +355,27 @@ impl Browser {
                     self.chdir(home.into(), None);
                 }
             }
+            // Capital O opens externally, unless it's part of a name being typed.
+            KeyCode::Char('O') if !self.typing() => self.open_external(),
             KeyCode::Char(c) if !ctrl => self.type_ahead(c),
             _ => {}
         }
         Action::None
+    }
+
+    /// True while a type-ahead prefix is still being entered.
+    fn typing(&self) -> bool {
+        !self.typed.is_empty() && self.last_typed.elapsed() <= Duration::from_millis(1000)
+    }
+
+    /// Opens the selected file or directory in the OS's default application.
+    fn open_external(&mut self) {
+        let Some(e) = self.entries.get(self.sel) else { return };
+        let (path, label) = (e.path.clone(), e.label());
+        match crate::external::open(&path) {
+            Ok(()) => self.flash(format!("Opening {label} in its default application")),
+            Err(err) => self.error(format!("Can't open {label}: {err}")),
+        }
     }
 
     /// Handles a mouse event; `None` means it was ignored.
@@ -512,7 +529,7 @@ impl Browser {
             }
             None => p.text(
                 self.theme.hint,
-                " Enter View  ← Up  Type to jump  F2 Sort  F3 Hidden  F4 Columns  Esc Exit",
+                " Enter View  O Open  ← Up  Type to jump  F2 Sort  F3 Hidden  F4 Cols  Esc Exit",
             ),
         }
         p.finish(out, y, self.theme.text)
@@ -701,6 +718,24 @@ mod tests {
             b.type_ahead(c);
         }
         assert_eq!(sel(&b), "baz");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capital_o_while_typing_a_name_jumps_instead_of_opening() {
+        let dir = std::env::temp_dir().join(format!("lyst-browser-o-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for n in ["fa", "foo"] {
+            fs::write(dir.join(n), "").unwrap();
+        }
+        let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        b.on_key(key('f'));
+        b.on_key(key('O'));
+        assert_eq!(b.entries[b.sel].name, "foo");
+        assert!(b.message.is_none(), "nothing was opened: {:?}", b.message);
+        assert!(b.typing());
         let _ = fs::remove_dir_all(&dir);
     }
 

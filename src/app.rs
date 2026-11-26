@@ -44,7 +44,8 @@ MARKS AND FILES
   m <letter>                set a mark at the top line
   ' <letter>                jump to a mark
   [ / ]                     previous / next file
-  O                         open the file browser at this file's directory
+  O                         open this file in its default application
+  B                         open the file browser at this file's directory
 
 MOUSE
   Wheel                     scroll (sideways swipe, or Shift/Option/Ctrl+wheel:
@@ -316,6 +317,18 @@ impl App {
         };
         self.want_browser = Some((dir, name));
         self.quit = true;
+    }
+
+    /// Opens the current file in the OS's default application.
+    fn open_external(&mut self) {
+        let Some(p) = self.current_path().map(std::path::Path::to_path_buf) else {
+            return self.error("Standard input has no file to open in another application");
+        };
+        let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+        match crate::external::open(&p) {
+            Ok(()) => self.flash(format!("Opening {name} in its default application")),
+            Err(e) => self.error(format!("Can't open {name}: {e}")),
+        }
     }
 
     pub fn set_search(&mut self, pattern: &str) {
@@ -728,7 +741,8 @@ impl App {
                 self.quit = true;
                 self.quit_all = true;
             }
-            KeyCode::Char('o' | 'O') => self.open_browser(),
+            KeyCode::Char('o' | 'O') => self.open_external(),
+            KeyCode::Char('B') => self.open_browser(),
             KeyCode::Up | KeyCode::Char('k') => self.scroll_up(1),
             KeyCode::Down | KeyCode::Enter | KeyCode::Char('j') => self.scroll_down(1),
             KeyCode::PageUp | KeyCode::Char('b') => self.scroll_up(page),
@@ -1230,9 +1244,9 @@ impl App {
             None => p.text(
                 self.theme.hint,
                 if self.from_browser {
-                    " F1 Help  F Find  A Again  L Line  W Wrap  H Hex  E Encoding  X Back  Q Quit"
+                    " F1 Help  F Find  A Again  L Line  W Wrap  H Hex  O Open  X Back  Q Quit"
                 } else {
-                    " F1 Help  F Find  A Again  L Line  W Wrap  H Hex  E Encoding  O Browse  X Exit"
+                    " F1 Help  F Find  A Again  L Line  W Wrap  H Hex  O Open  B Browse  X Exit"
                 },
             ),
         }
@@ -1401,6 +1415,30 @@ mod tests {
         o.follow = true;
         let a = app(&numbered(1000), o);
         assert!(a.view.top_line > 900, "top_line = {}", a.view.top_line);
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn open_externally_needs_a_real_file() {
+        let mut a = app(b"piped\n", opts());
+        a.on_key(key('o'));
+        assert!(matches!(&a.message, Some((m, true)) if m.contains("Standard input")));
+        assert!(!a.quit);
+    }
+
+    #[test]
+    fn capital_b_opens_the_browser() {
+        let mut a = app(b"x\n", opts());
+        a.on_key(key('B'));
+        assert!(a.quit && !a.quit_all);
+        assert!(a.want_browser.is_some());
+        // Lowercase b still pages up.
+        let mut a = app(b"x\n", opts());
+        a.on_key(key('b'));
+        assert!(!a.quit && a.want_browser.is_none());
     }
 
     #[test]

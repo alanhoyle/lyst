@@ -129,6 +129,11 @@ fn preprocessor_output_replaces_file_contents() {
     c.env("LYST_OPEN", "|echo reformatted %s").arg(&csv);
     assert_eq!(run(c, b"").stdout, b"a,b\n");
 
+    // A preprocessor that only adds colors is ignored in favor of the file.
+    let mut c = lyst();
+    c.env("LYST_OPEN", "|printf '\\033[32m'; cat %s; printf '\\033[0m'").arg(&f);
+    assert_eq!(run(c, b"").stdout, b"shout\n");
+
     // lesspipe's "==> ..." tips are switched off.
     let mut c = lyst();
     c.env("LYST_OPEN", "|echo quiet=$LESSQUIET #%s").arg(&f);

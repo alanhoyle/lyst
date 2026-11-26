@@ -147,6 +147,24 @@ fn escape_len(s: &[u8]) -> Option<(usize, Option<&[u8]>)> {
     }
 }
 
+/// `bytes` with ANSI escape sequences (colors, hyperlinks) removed.
+pub fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut pos = 0;
+    while let Some(i) = memchr::memchr(0x1b, &bytes[pos..]).map(|i| pos + i) {
+        out.extend_from_slice(&bytes[pos..i]);
+        match escape_len(&bytes[i..]) {
+            Some((n, _)) => pos = i + n,
+            None => {
+                out.push(0x1b);
+                pos = i + 1;
+            }
+        }
+    }
+    out.extend_from_slice(&bytes[pos..]);
+    out
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Cell {
     pub ch: char,
@@ -492,6 +510,15 @@ mod tests {
         assert_eq!(text(&layout(b"\x1b]8;;x", Encoding::Utf8, 8, usize::MAX, true)), "^[]8;;x");
         // OSC terminated by ESC \ is consumed.
         assert_eq!(text(&layout(b"\x1b]0;t\x1b\\z", Encoding::Utf8, 8, usize::MAX, true)), "z");
+    }
+
+    #[test]
+    fn stripping_escapes() {
+        assert_eq!(strip_ansi(b"\x1b[32m//\x1b[0m hi\tthere\n"), b"// hi\tthere\n");
+        assert_eq!(strip_ansi(b"\x1b]8;;http://x\x07link\x1b]8;;\x1b\\"), b"link");
+        assert_eq!(strip_ansi(b"plain"), b"plain");
+        // An escape that isn't a complete sequence is kept.
+        assert_eq!(strip_ansi(b"a\x1b[3"), b"a\x1b[3");
     }
 
     #[test]

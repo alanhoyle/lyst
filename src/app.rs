@@ -168,10 +168,14 @@ impl Source {
             Source::Path(p) => match crate::preprocess::file(p)? {
                 Some((bytes, filter)) => {
                     // Preprocessors such as lesspipe pass plain text through
-                    // unchanged; use the original file so it stays memory-mapped
-                    // and keeps follow mode and syntax highlighting.
+                    // unchanged, or only add colors (lesspipe runs bat when
+                    // LESS has -R). Use the original file then, so it stays
+                    // memory-mapped and keeps follow mode and our own syntax
+                    // highlighting, which S can toggle.
                     if let Ok(orig) = Document::open(p)
-                        && orig.bytes() == bytes.as_slice()
+                        && (orig.bytes() == bytes.as_slice()
+                            || (memchr::memchr(0x1b, &bytes).is_some()
+                                && encoding::strip_ansi(&bytes) == orig.bytes()))
                     {
                         return Ok(orig);
                     }
@@ -867,6 +871,9 @@ impl App {
                 self.opts.highlight.enabled = !self.opts.highlight.enabled;
                 let msg = match (&self.view.hl, self.opts.highlight.enabled) {
                     (_, false) => "Syntax highlighting off".to_string(),
+                    (_, true) if self.view.ansi => {
+                        "Syntax highlighting on, but this file's own ANSI colors are shown (C turns them off)".to_string()
+                    }
                     (Some(h), true) => format!("Syntax highlighting on ({})", h.name()),
                     (None, true) => "Syntax highlighting on (no syntax recognised for this file)".to_string(),
                 };

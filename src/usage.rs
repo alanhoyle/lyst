@@ -138,6 +138,14 @@ fn walk(root: &Path, p: &Progress) {
     }
 }
 
+/// Unix permission bits as `ls -l` shows them, e.g. `rw-r--r--`.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn mode_string(mode: u32) -> String {
+    let bits = [(0o400, 'r'), (0o200, 'w'), (0o100, 'x'), (0o40, 'r'), (0o20, 'w'), (0o10, 'x'), (0o4, 'r'), (0o2, 'w'), (0o1, 'x')];
+    let s: String = bits.iter().map(|&(b, c)| if mode & b != 0 { c } else { '-' }).collect();
+    format!("{s} ({:o})", mode & 0o7777)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +161,12 @@ mod tests {
             assert!(Instant::now() < deadline, "disk usage never finished");
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn permission_strings() {
+        assert_eq!(mode_string(0o100644), "rw-r--r-- (644)");
+        assert_eq!(mode_string(0o755), "rwxr-xr-x (755)");
     }
 
     #[test]

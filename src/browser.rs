@@ -1,6 +1,7 @@
 //! Directory browser shown when lyst is started without a file.
 
 use crate::app::{Painter, Style, Theme};
+use crate::findfiles::Walk;
 use crate::goto::DirPrompt;
 use crate::usage::Usage;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -84,6 +85,63 @@ impl Entry {
     }
 }
 
+pub const HELP: &str = "\
+lyst file browser
+
+MOVING AROUND
+  Up / Down, PgUp / PgDn    move the selection
+  Home / End                first / last entry
+  Enter or Right            open a directory, or view a file
+  Left or Backspace         up to the parent directory
+  ~                         your home directory
+  -                         back to the previous directory (again: return)
+  / name                    jump to the entry starting with name;
+                            / again: next match, Enter opens, Esc stops
+  J                         type a directory to go to, with Tab completion;
+                            empty, it lists recent directories (kept
+                            between runs), Up/Down or Tab to pick one
+  F                         find files and directories by name anywhere
+                            below here: words typed must all appear in the
+                            path; Up/Down pick, Enter opens, Esc returns
+
+FILES
+  Space                     tag the file (then Enter views just the tagged
+                            files, [ and ] stepping through them); Esc
+                            clears the tags
+  E or V                    edit the file in $VISUAL or $EDITOR
+  O                         open in its default application
+  W                         open in the default web browser
+  U                         disk usage of the file or directory
+  Y                         copy the full path to the clipboard
+
+DISPLAY
+  F2                        sort by name, extension, size or date
+  F3                        show or hide dotfiles
+  F4                        one line per file, or columns
+  F5 or Ctrl-R              reread the directory
+
+OTHER
+  h, F1 or ?                this help
+  F9                        mouse on/off
+  Q or Esc                  quit
+";
+
+/// Most results a find lists.
+const FIND_SHOWN: usize = 2000;
+
+/// The recursive find, while active.
+struct Find {
+    walk: Walk,
+    input: String,
+    /// Matches in all, of which `entries` shows up to `FIND_SHOWN`.
+    total: usize,
+    /// Paths found when the results were last updated.
+    seen: usize,
+    walking: bool,
+    /// The directory listing to return to: entries, selection, scroll.
+    saved: (Vec<Entry>, usize, usize),
+}
+
 pub enum Action {
     None,
     Open,
@@ -109,6 +167,15 @@ pub struct Browser {
     goto: Option<DirPrompt>,
     /// Disk usage being counted (or counted) for the selected entry.
     usage: Option<Usage>,
+    /// Recently visited directories, most recent first.
+    history: Vec<PathBuf>,
+    /// Tagged files, in the order they were tagged.
+    tags: Vec<PathBuf>,
+    find: Option<Find>,
+    /// The help page's scroll position, while shown.
+    help: Option<usize>,
+    /// Text to put on the clipboard with the next frame (OSC 52).
+    clipboard: Option<String>,
     /// Entry and time of the last left click, for double-click detection.
     last_click: Option<(usize, Instant)>,
     message: Option<(String, bool)>,
@@ -133,6 +200,11 @@ impl Browser {
             goto: None,
             want_edit: None,
             edit_warned: None,
+            history: Vec::new(),
+            tags: Vec::new(),
+            find: None,
+            help: None,
+            clipboard: None,
             last_click: None,
             message: None,
             theme: Theme::new(classic),
@@ -140,6 +212,7 @@ impl Browser {
             height: h as usize,
         };
         b.load()?;
+        b.history = crate::history::record(&[], &b.dir);
         // Land on the first real entry rather than "..".
         if b.entries.len() > 1 && b.entries[0].name == ".." {
             b.sel = 1;
@@ -202,6 +275,9 @@ impl Browser {
 
     /// Re-reads the directory, keeping the selection on the same name.
     pub fn refresh(&mut self) {
+        if self.find.is_some() {
+            return self.update_find(true);
+        }
         let name = self.entries.get(self.sel).map(|e| e.name.clone());
         if let Err(e) = self.load() {
             self.error(format!("{}: {e}", self.dir.display()));
@@ -218,6 +294,12 @@ impl Browser {
     }
 
     pub fn select_path(&mut self, path: &Path) {
+        if self.find.is_some() {
+            if let Some(i) = self.entries.iter().position(|e| e.path == path) {
+                self.sel = i;
+            }
+            return;
+        }
         if path.parent() == Some(self.dir.as_path())
             && let Some(n) = path.file_name()
         {
@@ -238,8 +320,14 @@ impl Browser {
         self.message = Some((s.into(), true));
     }
 
-    /// All plain files in the listing, plus the index of the selected one.
+    /// The files to view, plus the index of the selected one: the tagged
+    /// files if any, else all plain files in the listing.
     pub fn file_list(&self) -> (Vec<PathBuf>, usize) {
+        if !self.tags.is_empty() {
+            let sel = self.entries.get(self.sel).map(|e| &e.path);
+            let idx = self.tags.iter().position(|t| Some(t) == sel).unwrap_or(0);
+            return (self.tags.clone(), idx);
+        }
         let mut idx = 0;
         let mut files = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
@@ -285,6 +373,140 @@ impl Browser {
         if let Some(n) = select {
             self.select_name(&n);
         }
+        self.history = crate::history::record(&self.history, &self.dir);
+    }
+
+    /// `-`: the most recent other directory that still exists.
+    fn go_back(&mut self) {
+        let Some(prev) = self.history.iter().find(|d| **d != self.dir && d.is_dir()).cloned() else {
+            return self.error("No previous directory");
+        };
+        let here = self.dir.clone();
+        self.chdir(prev, None);
+        // Coming back to a directory selects the one just left, if inside it.
+        if here.parent() == Some(self.dir.as_path()) {
+            self.select_path(&here);
+        }
+    }
+
+    /// Recent directories for the go-to prompt, as typed.
+    fn recent(&self) -> Vec<String> {
+        self.history.iter().filter(|d| **d != self.dir).take(50).map(|d| crate::history::display(d)).collect()
+    }
+
+    // --------------------------------------------------------------- tags
+
+    fn toggle_tag(&mut self) {
+        let Some(e) = self.entries.get(self.sel) else { return };
+        if e.is_dir {
+            return self.error("Only files can be tagged");
+        }
+        let p = e.path.clone();
+        if let Some(i) = self.tags.iter().position(|t| *t == p) {
+            self.tags.remove(i);
+        } else {
+            self.tags.push(p);
+        }
+        self.sel = (self.sel + 1).min(self.entries.len().saturating_sub(1));
+        match self.tags.len() {
+            0 => self.flash("No files tagged"),
+            n => self.flash(format!("{n} tagged: Enter views them, Esc clears")),
+        }
+    }
+
+    // --------------------------------------------------------------- find
+
+    fn start_find(&mut self) {
+        let saved = (std::mem::take(&mut self.entries), self.sel, self.top);
+        let walk = Walk::start(&self.dir, self.show_hidden);
+        self.find = Some(Find { walk, input: String::new(), total: 0, seen: 0, walking: true, saved });
+        self.sel = 0;
+        self.top = 0;
+        self.update_find(false);
+    }
+
+    /// Lists the paths matching the find input. `keep` keeps the same path
+    /// selected (new results arrived); otherwise the first is selected.
+    fn update_find(&mut self, keep: bool) {
+        let Some(f) = &mut self.find else { return };
+        let (hits, total) = f.walk.matching(&f.input, FIND_SHOWN);
+        f.total = total;
+        f.seen = f.walk.count();
+        f.walking = !f.walk.done();
+        let root = f.walk.root.clone();
+        let selected = self.entries.get(self.sel).map(|e| e.path.clone()).filter(|_| keep);
+        self.entries = hits
+            .into_iter()
+            .map(|rel| {
+                let name = rel.trim_end_matches('/').to_string();
+                let path = root.join(&name);
+                let meta = fs::symlink_metadata(&path).ok();
+                Entry {
+                    is_dir: rel.ends_with('/'),
+                    is_link: meta.as_ref().is_some_and(|m| m.file_type().is_symlink()),
+                    size: meta.as_ref().map_or(0, |m| m.len()),
+                    modified: meta.and_then(|m| m.modified().ok()),
+                    name,
+                    path,
+                }
+            })
+            .collect();
+        self.sel = selected.and_then(|p| self.entries.iter().position(|e| e.path == p)).unwrap_or(0);
+        if !keep {
+            self.top = 0;
+        }
+    }
+
+    /// Leaves the find, back to the directory listing (`restore`) or not
+    /// (a result was opened elsewhere).
+    fn end_find(&mut self, restore: bool) {
+        if let Some(f) = self.find.take()
+            && restore
+        {
+            (self.entries, self.sel, self.top) = f.saved;
+        }
+    }
+
+    /// Handles a key while finding; `None` lets the normal handling move
+    /// the selection.
+    fn find_key(&mut self, k: KeyEvent) -> Option<Action> {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let f = self.find.as_mut()?;
+        match k.code {
+            KeyCode::Esc => self.end_find(true),
+            KeyCode::Char('c') if ctrl => self.end_find(true),
+            KeyCode::Enter => return Some(self.activate()),
+            KeyCode::Backspace => {
+                f.input.pop();
+                self.update_find(false);
+            }
+            KeyCode::Char('u') if ctrl => {
+                f.input.clear();
+                self.update_find(false);
+            }
+            KeyCode::Char(c) if !ctrl => {
+                f.input.push(c);
+                self.update_find(false);
+            }
+            KeyCode::Left | KeyCode::Right => {}
+            _ => return None,
+        }
+        Some(Action::None)
+    }
+
+    // --------------------------------------------------------------- help
+
+    fn help_key(&mut self, k: KeyEvent) {
+        let Some(scroll) = self.help else { return };
+        let max = HELP.lines().count().saturating_sub(self.rows());
+        let page = self.rows().saturating_sub(1).max(1);
+        self.help = match k.code {
+            KeyCode::Up | KeyCode::Char('k') => Some(scroll.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => Some((scroll + 1).min(max)),
+            KeyCode::PageUp | KeyCode::Char('b') => Some(scroll.saturating_sub(page)),
+            KeyCode::PageDown | KeyCode::Char(' ') => Some((scroll + page).min(max)),
+            _ => None,
+        };
     }
 
     fn parent(&mut self) {
@@ -300,6 +522,7 @@ impl Browser {
             self.parent();
         } else if e.is_dir {
             let p = e.path.clone();
+            self.end_find(false);
             self.chdir(p, None);
         } else {
             return Action::Open;
@@ -352,9 +575,16 @@ impl Browser {
     pub fn on_key(&mut self, k: KeyEvent) -> Action {
         self.message = None;
         let warned = self.edit_warned.take();
+        if self.help.is_some() {
+            self.help_key(k);
+            return Action::None;
+        }
         if self.goto.is_some() {
             self.goto_key(k);
             return Action::None;
+        }
+        if let Some(action) = self.find_key(k) {
+            return action;
         }
         if let Some(action) = self.jump_key(k) {
             return action;
@@ -367,6 +597,10 @@ impl Browser {
             KeyCode::Char('c') if ctrl => return Action::Quit,
             KeyCode::Char('s') if ctrl => self.cycle_sort(),
             KeyCode::Char('r') if ctrl => self.refresh(),
+            KeyCode::Esc if !self.tags.is_empty() => {
+                self.tags.clear();
+                self.flash("Tags cleared");
+            }
             KeyCode::Esc => return Action::Quit,
             KeyCode::Up if self.sel >= cols => self.sel -= cols,
             KeyCode::Up => {}
@@ -380,7 +614,7 @@ impl Browser {
             KeyCode::Left if self.wide => self.sel = self.sel.saturating_sub(1),
             KeyCode::Right if self.wide => self.sel = (self.sel + 1).min(last),
             KeyCode::Enter | KeyCode::Right => return self.activate(),
-            KeyCode::Left | KeyCode::Backspace => self.parent(),
+            KeyCode::Left | KeyCode::Backspace if self.find.is_none() => self.parent(),
             KeyCode::F(4) => self.wide = !self.wide,
             KeyCode::F(2) => self.cycle_sort(),
             KeyCode::F(3) => {
@@ -398,7 +632,18 @@ impl Browser {
             KeyCode::Char('q' | 'Q') if !ctrl => return Action::Quit,
             KeyCode::Char('w' | 'W') if !ctrl => self.open_web(),
             KeyCode::Char('e' | 'E' | 'v' | 'V') if !ctrl => self.request_edit(warned),
-            KeyCode::Char('j' | 'J') if !ctrl => self.goto = Some(DirPrompt::new(&self.dir, self.show_hidden)),
+            KeyCode::Char('j' | 'J') if !ctrl => self.goto = Some(DirPrompt::new(&self.dir, self.show_hidden, self.recent())),
+            KeyCode::Char('-') => self.go_back(),
+            KeyCode::Char(' ') => self.toggle_tag(),
+            KeyCode::Char('f' | 'F') if !ctrl => self.start_find(),
+            KeyCode::Char('y' | 'Y') if !ctrl => {
+                if let Some(e) = self.entries.get(self.sel) {
+                    let p = e.path.display().to_string();
+                    self.flash(format!("Copied {p}"));
+                    self.clipboard = Some(p);
+                }
+            }
+            KeyCode::F(1) | KeyCode::Char('h' | 'H' | '?') => self.help = Some(0),
             KeyCode::Char('u' | 'U') if !ctrl => {
                 if let Some(e) = self.entries.get(self.sel) {
                     self.usage = Some(Usage::start(&e.path));
@@ -490,6 +735,13 @@ impl Browser {
     /// Called when idle; true if the screen needs redrawing for disk usage
     /// progress or its final total.
     pub fn tick(&mut self) -> bool {
+        if let Some(f) = &self.find
+            && f.walking
+            && (f.walk.count() != f.seen || f.walk.done())
+        {
+            self.update_find(true);
+            return true;
+        }
         let Some(u) = &mut self.usage else { return false };
         if u.reported {
             return false;
@@ -547,6 +799,16 @@ impl Browser {
     pub fn on_mouse(&mut self, m: MouseEvent) -> Option<Action> {
         let (colw, cols) = self.grid();
         let last = self.entries.len().saturating_sub(1);
+        if let Some(scroll) = self.help {
+            let max = HELP.lines().count().saturating_sub(self.rows());
+            self.help = match m.kind {
+                MouseEventKind::ScrollDown => Some((scroll + 3).min(max)),
+                MouseEventKind::ScrollUp => Some(scroll.saturating_sub(3)),
+                MouseEventKind::Down(_) => None,
+                _ => return None,
+            };
+            return Some(Action::None);
+        }
         if self.goto.is_some() && matches!(m.kind, MouseEventKind::Down(_)) {
             self.goto = None;
             return Some(Action::None);
@@ -602,16 +864,31 @@ impl Browser {
             self.top = sel_row + 1 - rows;
         }
         queue!(out, terminal::BeginSynchronizedUpdate, cursor::Hide)?;
+        if let Some(text) = self.clipboard.take() {
+            queue!(out, crossterm::style::Print(crate::external::osc52(&text)))?;
+        }
 
         // Status bar: directory on the left, counts and sort on the right.
         let dirs = self.entries.iter().filter(|e| e.is_dir && e.name != "..").count();
         let files = self.entries.iter().filter(|e| !e.is_dir).count();
-        let right = format!(
-            "{dirs} dirs  {files} files  Sort: {}{} ",
-            self.sort.label(),
-            if self.show_hidden { "  +hidden" } else { "" }
-        );
-        let left = format!(" {}", truncate_left(&self.dir.display().to_string(), self.width.saturating_sub(right.width() + 2)));
+        let tagged = if self.tags.is_empty() { String::new() } else { format!("{} tagged  ", self.tags.len()) };
+        let right = match &self.find {
+            Some(f) => {
+                let more = if f.total > self.entries.len() { format!(" (first {})", self.entries.len()) } else { String::new() };
+                let busy = if f.walking { format!("  searching… {} paths", f.seen) } else { String::new() };
+                format!("{tagged}{} matches{more}{busy} ", f.total)
+            }
+            None => format!(
+                "{tagged}{dirs} dirs  {files} files  Sort: {}{} ",
+                self.sort.label(),
+                if self.show_hidden { "  +hidden" } else { "" }
+            ),
+        };
+        let where_ = match &self.find {
+            Some(_) => format!("Find under {}", self.dir.display()),
+            None => self.dir.display().to_string(),
+        };
+        let left = format!(" {}", truncate_left(&where_, self.width.saturating_sub(right.width() + 2)));
         let mut p = Painter::new(self.width);
         let bold = crate::app::Style { bold: true, ..self.theme.status };
         p.text(bold, &left);
@@ -619,7 +896,16 @@ impl Browser {
         p.text(self.theme.status, &right);
         p.finish(out, 0, self.theme.status)?;
 
-        if self.wide {
+        if let Some(scroll) = self.help {
+            for (y, i) in (scroll..scroll + self.rows()).enumerate() {
+                let mut p = Painter::new(self.width);
+                if let Some(l) = HELP.lines().nth(i) {
+                    let heading = l.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+                    p.text(if heading { Style { bold: true, ..self.theme.text } } else { self.theme.text }, l);
+                }
+                p.finish(out, y + 1, self.theme.text)?;
+            }
+        } else if self.wide {
             self.draw_grid(out, colw, cols)?;
         } else {
             self.draw_list(out)?;
@@ -650,6 +936,13 @@ impl Browser {
                 let Some(e) = self.entries.get(i) else { break };
                 let style = self.entry_style(i, e);
                 let label = truncate_right(&e.label(), cell);
+                if self.tags.contains(&e.path) {
+                    p.text(self.theme.hit, "•");
+                    p.text(style, &truncate_right(&label, cell.saturating_sub(1)));
+                    p.text(style, &" ".repeat(cell.saturating_sub(label.width().min(cell.saturating_sub(1)) + 1)));
+                    p.text(self.theme.text, "  ");
+                    continue;
+                }
                 p.text(style, &label);
                 p.text(style, &" ".repeat(cell.saturating_sub(label.width())));
                 p.text(self.theme.text, "  ");
@@ -670,7 +963,11 @@ impl Browser {
             if let Some(e) = self.entries.get(i) {
                 let style = self.entry_style(i, e);
                 let name = truncate_right(&e.label(), name_w);
-                p.text(style, " ");
+                if self.tags.contains(&e.path) {
+                    p.text(Style { bold: true, ..self.theme.hit }, "•");
+                } else {
+                    p.text(style, " ");
+                }
                 p.text(style, &name);
                 p.text(style, &" ".repeat(name_w.saturating_sub(name.width())));
                 let size = if e.is_dir { "<DIR>".to_string() } else { human_size(e.size) };
@@ -697,7 +994,9 @@ impl Browser {
         for (k, i) in (start..start + shown).enumerate() {
             let m = &g.matches[i];
             // Just the last component; the input shows the rest.
-            let name = m.trim_end_matches('/').rsplit('/').next().unwrap_or(m);
+            // Recent directories in full; otherwise just the last
+            // component, since the input shows the rest.
+            let name = if g.showing_recent { m.trim_end_matches('/') } else { m.trim_end_matches('/').rsplit('/').next().unwrap_or(m) };
             let style = if g.sel == Some(i) { self.theme.select } else { self.theme.status };
             let mut p = Painter::new(self.width);
             p.text(style, &format!("  {name}/"));
@@ -715,9 +1014,34 @@ impl Browser {
     fn draw_bottom(&self, out: &mut impl Write) -> io::Result<()> {
         let y = self.height.saturating_sub(1);
         let mut p = Painter::new(self.width);
+        if self.help.is_some() {
+            p.text(self.theme.hint, " Up/Down/PgUp/PgDn scroll · any other key returns");
+            return p.finish(out, y, self.theme.text);
+        }
+        if let Some(f) = &self.find {
+            let label = " Find: ";
+            let room = self.width.saturating_sub(label.width() + 1);
+            let shown = truncate_left(&f.input, room);
+            p.text(Style { bold: true, ..self.theme.text }, label);
+            p.text(self.theme.text, &shown);
+            let hint = match &self.message {
+                Some((m, _)) => format!("   {m}"),
+                None if f.input.is_empty() => "   words to look for in paths  ↑/↓ pick  Enter opens  Esc returns".into(),
+                None if f.total == 0 && !f.walking => "   (no matches)".into(),
+                None => String::new(),
+            };
+            p.text(self.theme.hint, &hint);
+            let cx = (label.width() + shown.width()).min(self.width.saturating_sub(1));
+            p.finish(out, y, self.theme.text)?;
+            return queue!(out, cursor::MoveTo(cx as u16, y as u16), cursor::Show);
+        }
         if let Some(g) = &self.goto {
             let label = " Go to directory: ";
-            let hint = if g.input.is_empty() { "   Tab completes  ~ home  Esc cancels" } else { "" };
+            let hint = match (g.input.is_empty(), g.showing_recent) {
+                (true, true) => "   ↑/↓ recent directories  Tab completes  Esc cancels",
+                (true, false) => "   Tab completes  ~ home  Esc cancels",
+                _ => "",
+            };
             // Keep the end of a long path in view.
             let room = self.width.saturating_sub(label.width() + 1);
             let shown = truncate_left(&g.input, room);
@@ -748,18 +1072,18 @@ impl Browser {
                     let date = e.modified.map(format_time).unwrap_or_default();
                     p.text(self.theme.text, &format!(" {}  {size}  {date}", e.label()));
                 }
-                p.text(self.theme.hint, "   F4 Details  F2 Sort  F3 Hidden  Esc Exit");
+                p.text(self.theme.hint, "   h Help  F4 Details  Q Quit");
             }
             None => p.text(
                 self.theme.hint,
-                " Enter View  E Edit  O Open  W Web  ← Up  / Jump  J Go to  U Usage  F2 Sort  F3 Hidden  F4 Cols  Esc Exit",
+                " h Help  Enter View  / Jump  J Go to  F Find  - Back  Space Tag  E Edit  U Usage  Q Quit",
             ),
         }
         p.finish(out, y, self.theme.text)
     }
 }
 
-fn human_size(n: u64) -> String {
+pub(crate) fn human_size(n: u64) -> String {
     if n < 100_000 {
         return n.to_string();
     }
@@ -1042,6 +1366,154 @@ mod tests {
         assert_eq!(b.entries[b.sel].name, "c.txt");
         assert!(b.message.is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn press(b: &mut Browser, s: &str) {
+        for c in s.chars() {
+            b.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    fn code(b: &mut Browser, c: KeyCode) -> Action {
+        b.on_key(KeyEvent::new(c, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn f_finds_files_below_and_esc_returns() {
+        let dir = std::env::temp_dir().join(format!("lyst-browser-find-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("a/b/notes.md"), "x").unwrap();
+        fs::write(dir.join("a/other.md"), "x").unwrap();
+        fs::write(dir.join("top.txt"), "x").unwrap();
+        let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
+        let before = labels(&b);
+
+        press(&mut b, "f");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while b.find.as_ref().unwrap().walking {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+            b.tick();
+        }
+        assert_eq!(b.entries.len(), 5, "everything, while nothing is typed: {:?}", labels(&b));
+        press(&mut b, "B NOTE");
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(labels(&b), [format!("a{sep}b{sep}notes.md")]);
+        // Enter opens it; the results stay for when the viewer closes.
+        assert!(matches!(code(&mut b, KeyCode::Enter), Action::Open));
+        let (files, idx) = b.file_list();
+        assert_eq!(files[idx], dir.join("a/b/notes.md").canonicalize().unwrap());
+        b.refresh();
+        assert_eq!(b.entries.len(), 1);
+
+        // Esc goes back to the listing as it was.
+        code(&mut b, KeyCode::Esc);
+        assert!(b.find.is_none());
+        assert_eq!(labels(&b), before);
+
+        // Entering a found directory leaves the find there.
+        press(&mut b, "f");
+        while b.find.as_ref().unwrap().walking {
+            std::thread::sleep(Duration::from_millis(5));
+            b.tick();
+        }
+        press(&mut b, "a");
+        b.sel = b.entries.iter().position(|e| e.name == "a").unwrap();
+        code(&mut b, KeyCode::Enter);
+        assert!(b.find.is_none());
+        assert!(b.dir.ends_with("a"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn space_tags_files_to_view_together() {
+        let dir = fixture("tags");
+        let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
+        let names = |b: &Browser, v: &[PathBuf]| -> Vec<String> {
+            let _ = b;
+            v.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect()
+        };
+        // Directories can't be tagged.
+        b.sel = b.entries.iter().position(|e| e.is_dir && e.name != "..").unwrap();
+        press(&mut b, " ");
+        assert!(b.tags.is_empty() && b.message.as_ref().is_some_and(|(_, e)| *e));
+        let files: Vec<usize> = (0..b.entries.len()).filter(|&i| !b.entries[i].is_dir).collect();
+        b.sel = files[2];
+        press(&mut b, " ");
+        b.sel = files[0];
+        press(&mut b, " ");
+        assert_eq!(b.sel, files[0] + 1, "moves down after tagging");
+        let (list, idx) = b.file_list();
+        assert_eq!(list.len(), 2);
+        assert_eq!(names(&b, &list), [b.entries[files[2]].name.clone(), b.entries[files[0]].name.clone()]);
+        assert_eq!(idx, 0, "the selection isn't tagged: start at the first tagged file");
+        b.sel = files[0];
+        assert_eq!(b.file_list().1, 1);
+        // Untag, then Esc clears the rest before it quits.
+        press(&mut b, " ");
+        assert_eq!(b.tags.len(), 1);
+        assert!(matches!(code(&mut b, KeyCode::Esc), Action::None));
+        assert!(b.tags.is_empty());
+        assert!(matches!(code(&mut b, KeyCode::Esc), Action::Quit));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn minus_goes_back_and_j_lists_recent_directories() {
+        let dir = std::env::temp_dir().join(format!("lyst-browser-back-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("one/two")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
+        press(&mut b, "-");
+        assert!(b.message.as_ref().is_some_and(|(m, _)| m.contains("No previous")));
+        b.chdir(dir.join("one/two"), None);
+        press(&mut b, "-");
+        assert_eq!(b.dir, dir);
+        press(&mut b, "-");
+        assert_eq!(b.dir, dir.join("one/two"), "again returns");
+        // The empty prompt offers the other directories, most recent first.
+        press(&mut b, "j");
+        let g = b.goto.as_ref().unwrap();
+        assert!(g.showing_recent);
+        assert_eq!(g.matches[0], crate::history::display(&dir));
+        code(&mut b, KeyCode::Down);
+        code(&mut b, KeyCode::Enter);
+        assert_eq!(b.dir, dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn h_shows_help_and_y_copies_the_path() {
+        let mut b = Browser::new(Path::new("samples"), false, Prefs::new(false)).unwrap();
+        b.resize(80, 20);
+        press(&mut b, "h");
+        let mut out = Vec::new();
+        b.draw(&mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("lyst file browser"));
+        // The wheel scrolls it (not past the end); a click closes it.
+        let mouse = |kind| MouseEvent { kind, column: 0, row: 0, modifiers: KeyModifiers::NONE };
+        b.resize(80, 10);
+        b.on_mouse(mouse(MouseEventKind::ScrollDown));
+        assert_eq!(b.help, Some(3));
+        for _ in 0..50 {
+            b.on_mouse(mouse(MouseEventKind::ScrollDown));
+        }
+        assert_eq!(b.help, Some(HELP.lines().count() - 8));
+        b.on_mouse(mouse(MouseEventKind::ScrollUp));
+        assert_eq!(b.help, Some(HELP.lines().count() - 11));
+        b.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        assert!(b.help.is_none());
+        b.resize(80, 20);
+        press(&mut b, "h");
+        press(&mut b, "x");
+        assert!(b.help.is_none(), "any other key closes it");
+        press(&mut b, "y");
+        let path = b.entries[b.sel].path.display().to_string();
+        let mut out = Vec::new();
+        b.draw(&mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains(&crate::external::osc52(&path)));
     }
 
     #[test]

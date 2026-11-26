@@ -56,6 +56,10 @@ impl Search {
         None
     }
 
+    pub fn is_match(&self, hay: &[u8]) -> bool {
+        self.re.is_match(hay)
+    }
+
     /// Non-empty matches within `hay`, relative to it.
     pub fn matches_in(&self, hay: &[u8]) -> Vec<Match> {
         self.re

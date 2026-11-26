@@ -3,6 +3,7 @@
 use crate::doc::Document;
 use crate::encoding::{self, AnsiStyle, Cell, CellKind, Encoding};
 use crate::highlight::{self, DocHighlighter, HlConfig, Span};
+use crate::rows::{self, Op};
 use crate::search::{Match, Search};
 use crate::table::{Format, RowKind, TCell, Table};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -31,6 +32,9 @@ SEARCHING
   R                         toggle regex vs literal search
   In the prompt: Up/Down recall history, Ctrl-R toggles regex.
   Searches ignore case unless the pattern contains a capital letter.
+  &                         show only lines matching a pattern (!pattern:
+                            lines not matching); & then Enter shows all.
+                            Line numbers stay those of the file.
 
 DISPLAY
   w                         toggle line wrap
@@ -42,7 +46,13 @@ DISPLAY
   T                         follow mode: keep reading as the file grows
   D                         table view for CSV/TSV (on by default for .csv,
                             .tsv, .vcf, .bed, .gtf, .gff, .sam); in it,
-                            Left/Right move by column and S toggles colors
+                            Left/Right select a column, scrolling as needed,
+                            and S toggles colors
+  < / >                     (table view) sort rows by the selected column
+                            (Left/Right select one, highlighted in the
+                            header), descending / ascending; numbers by value,
+                            chr2 before chr10; again for file order
+  P                         (table view) pin the first column (on by default)
 
 MARKS AND FILES
   m <letter>                set a mark at the top line
@@ -52,6 +62,10 @@ MARKS AND FILES
   W                         open this file in the default web browser
   V                         edit this file in $VISUAL or $EDITOR, then reload
   B                         open the file browser at this file's directory
+  y                         copy the current line (the one with the search
+                            match, else the top line) to the clipboard
+  Y                         copy this file's full path
+  =                         file information: path, size, lines, type...
 
 MOUSE
   Wheel                     scroll (sideways swipe, or Shift/Option/Ctrl+wheel:
@@ -62,7 +76,7 @@ MOUSE
   goes up a directory, the wheel moves the selection.
 
 OTHER
-  F1 or ?                   this help
+  h, F1 or ?                this help
   Ctrl-L                    redraw the screen
   X or Esc                  close (back to the file browser, if open)
   Q                         quit
@@ -208,6 +222,18 @@ struct View {
     ansi: bool,
     /// Show delimited text as aligned columns.
     table: Option<Table>,
+    /// Set while lines are filtered or sorted: the document shown is built
+    /// from this original.
+    derived: Option<Box<Derived>>,
+}
+
+/// The original document behind a filtered or sorted one.
+struct Derived {
+    base: Document,
+    base_view: View,
+    ops: Vec<Op>,
+    /// Shown line -> original line.
+    map: Vec<usize>,
 }
 
 impl View {
@@ -243,12 +269,15 @@ enum Dir {
 enum PromptKind {
     Find(Dir),
     Goto,
+    Filter,
 }
 
 enum Mode {
     Normal,
     Prompt { kind: PromptKind, input: String, hist: Option<usize> },
     Help { scroll: usize },
+    /// File information (`=`), shown like the help page.
+    Info { scroll: usize },
     Mark { set: bool },
 }
 
@@ -280,6 +309,8 @@ pub struct App {
     /// Launched from the file browser, so exiting returns there.
     pub from_browser: bool,
     pub full_redraw: bool,
+    /// Text to put on the clipboard with the next frame (OSC 52).
+    clipboard: Option<String>,
 }
 
 impl App {
@@ -309,6 +340,7 @@ impl App {
             edit_warned: None,
             from_browser: false,
             full_redraw: false,
+            clipboard: None,
         };
         app.view = app.fresh_view();
         if app.view.hex && !app.opts.hex {
@@ -431,16 +463,293 @@ impl App {
         self.normalize();
     }
 
-    /// Scrolls the table one column left or right.
+    /// Moves the table's column cursor one column left or right.
     fn column_step(&mut self, right: bool) {
+        let Some(t) = &mut self.view.table else { return };
+        let n = t.column_starts().len();
+        t.cursor = if right { (t.cursor + 1).min(n.saturating_sub(1)) } else { t.cursor.saturating_sub(1) };
+        self.show_cursor_column();
+    }
+
+    /// Scrolls sideways, as little as possible and by whole columns, so the
+    /// cursor's column is on screen.
+    fn show_cursor_column(&mut self) {
+        let tw = self.text_width();
         let Some(t) = &self.view.table else { return };
         let starts = t.column_starts();
-        let h = self.view.hscroll;
-        self.view.hscroll = if right {
-            starts.iter().copied().find(|&x| x > h).unwrap_or(h)
-        } else {
-            starts.iter().copied().rev().find(|&x| x < h).unwrap_or(0)
+        if starts.is_empty() {
+            return;
+        }
+        let c = t.cursor.min(starts.len() - 1);
+        let (s, e) = (starts[c], starts[c] + t.column_width(c));
+        let pin = t.pin && starts.len() > 2;
+        let pw = starts.get(1).copied().unwrap_or(0);
+        let visible = |x: usize| {
+            if c == 0 {
+                return x == 0 || (pin && x >= pw);
+            }
+            // With the first column pinned, the rest of the screen shows
+            // from `x` on.
+            let room = if pin && x >= pw { tw.saturating_sub(pw) } else { tw };
+            s >= x && e <= x + room
         };
+        if visible(self.view.hscroll) {
+            return;
+        }
+        self.view.hscroll = if s < self.view.hscroll {
+            // Pinned, scrolling to the second column looks like not scrolling.
+            if pin && s <= pw { 0 } else { s }
+        } else {
+            starts.iter().copied().find(|&x| visible(x)).unwrap_or(s)
+        };
+    }
+
+    /// The table's selected column (0-based).
+    fn current_column(&self) -> Option<usize> {
+        self.view.table.as_ref().map(|t| t.cursor)
+    }
+
+    // ------------------------------------------------------- filter and sort
+
+    /// The original line number of shown line `i`.
+    fn orig_line(&self, i: usize) -> usize {
+        match &self.view.derived {
+            Some(d) => d.map.get(i).copied().unwrap_or(i),
+            None => i,
+        }
+    }
+
+    /// Filters and sorts in effect.
+    fn ops(&self) -> Vec<Op> {
+        self.view.derived.as_ref().map(|d| d.ops.clone()).unwrap_or_default()
+    }
+
+    /// Shows the original document with `ops` applied (none: the original
+    /// itself). Returns false, changing nothing, on an error or if a filter
+    /// leaves no rows.
+    fn set_ops(&mut self, ops: Vec<Op>) -> bool {
+        let (base, base_view) = match &self.view.derived {
+            Some(d) => (&d.base, &d.base_view),
+            None => (&self.doc, &self.view),
+        };
+        let header = base_view.table.as_ref().and_then(|t| t.header);
+        let lines = if ops.is_empty() {
+            Vec::new()
+        } else {
+            match rows::apply(base, base_view.table.as_ref(), &ops) {
+                Ok(l) if ops.iter().any(Op::is_filter) && l.iter().all(|&i| Some(i) == header) => {
+                    self.error("No lines match");
+                    return false;
+                }
+                Ok(l) => l,
+                Err(e) => {
+                    self.error(e);
+                    return false;
+                }
+            }
+        };
+        let top = self.orig_line(self.view.top_line);
+        let hscroll = self.view.hscroll;
+        // Table settings as they are now, which may differ from the original's.
+        let shown = self.view.table.as_ref().map(|t| (t.cursor, t.colors, t.pin));
+        let carry = |t: &mut Table| {
+            if let Some((cursor, colors, pin)) = shown {
+                (t.cursor, t.colors, t.pin) = (cursor, colors, pin);
+            }
+        };
+        let (base, mut base_view) = match self.view.derived.take() {
+            Some(d) => (d.base, d.base_view),
+            None => (std::mem::replace(&mut self.doc, Document::from_bytes("", Vec::new())), std::mem::take(&mut self.view)),
+        };
+        self.view.cur_match = None;
+        self.opts.follow = false;
+        self.invalidate_layout();
+        if ops.is_empty() {
+            base_view.top_line = top;
+            base_view.top_sub = 0;
+            base_view.hscroll = hscroll;
+            base_view.cur_match = None;
+            if let Some(t) = &mut base_view.table {
+                carry(t);
+            }
+            self.doc = base;
+            self.view = base_view;
+            self.normalize();
+            return true;
+        }
+        let doc = rows::build(&base, &lines);
+        let mut view = View::new(&doc, &self.opts);
+        view.hex = false;
+        view.ansi = base_view.ansi;
+        view.hscroll = hscroll;
+        let (enc, tab, ansi) = (self.opts.encoding, self.opts.tab, view.ansi);
+        view.table = base_view.table.as_ref().map(|t| {
+            let mut nt = Table::new(&doc, t.format, &|b: &[u8], m| encoding::layout(b, enc, tab, m, ansi));
+            carry(&mut nt);
+            nt
+        });
+        // A new sort starts at the top; a filter stays near the same place.
+        view.top_line = if matches!(ops.last(), Some(Op::Sort { .. })) {
+            0
+        } else {
+            lines.partition_point(|&l| l < top).min(lines.len().saturating_sub(1))
+        };
+        view.derived = Some(Box::new(Derived { base, base_view, ops, map: lines }));
+        self.doc = doc;
+        self.view = view;
+        self.normalize();
+        true
+    }
+
+    /// `&`: shows only matching lines (`!` first: not matching); empty
+    /// input shows all lines again. A sort stays in effect.
+    fn apply_filter(&mut self, input: &str) {
+        let mut ops: Vec<Op> = self.ops().into_iter().filter(|o| !o.is_filter()).collect();
+        if input.is_empty() {
+            if self.ops().iter().any(Op::is_filter) && self.set_ops(ops) {
+                self.flash(format!("Filter off: all {} lines", self.doc.line_count()));
+            }
+            return;
+        }
+        let op = match Op::filter(input, self.opts.regex) {
+            Ok(op) => op,
+            Err(e) => return self.error(format!("Bad pattern: {e}")),
+        };
+        self.history.retain(|h| h != input);
+        self.history.push(input.to_string());
+        ops.insert(0, op.clone());
+        if self.set_ops(ops) {
+            let total = self.view.derived.as_ref().map_or(0, |d| d.base.line_count());
+            let header = usize::from(self.view.table.as_ref().is_some_and(|t| t.header.is_some()));
+            let shown = self.view.derived.as_ref().map_or(0, |d| d.map.len()) - header;
+            self.flash(format!("Showing {shown} of {total} lines: {} (& then Enter shows all)", op.label()));
+        }
+    }
+
+    /// `>` / `<`: sorts table rows by the column at the left edge; the same
+    /// key on the same column again restores the file's order.
+    fn sort_by_column(&mut self, desc: bool) {
+        let Some(col) = self.current_column().filter(|_| !self.view.hex) else {
+            return self.error("Sorting works in table view (D): ←/→ pick the column");
+        };
+        let mut ops: Vec<Op> = self.ops();
+        let same = ops.contains(&Op::Sort { col, desc });
+        ops.retain(|o| o.is_filter());
+        if same {
+            if self.set_ops(ops) {
+                self.flash("Rows in file order");
+            }
+            return;
+        }
+        ops.push(Op::Sort { col, desc });
+        if self.set_ops(ops) {
+            let t = self.view.table.as_ref().expect("table view");
+            let name = t.column_name(&self.doc, col).map_or(String::new(), |n| format!(" ({n})"));
+            let dir = if desc { "descending (> ascending" } else { "ascending (< descending" };
+            self.flash(format!("Sorted by column {}{name}, {dir}, same key again for file order)", col + 1));
+        }
+    }
+
+    // ------------------------------------------------------- copy and info
+
+    /// `y`: copies the line with the current match, or the top line; `Y`:
+    /// the file's path. Uses the terminal's clipboard (OSC 52), which works
+    /// over SSH too.
+    fn copy(&mut self, path: bool) {
+        if path {
+            let Some(p) = self.current_path() else { return self.error("Standard input has no path to copy") };
+            let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string();
+            self.flash(format!("Copied {p}"));
+            self.clipboard = Some(p);
+            return;
+        }
+        let line = match self.view.cur_match {
+            Some((s, _)) if !self.view.hex => {
+                let l = self.doc.line_of_offset(s);
+                if l >= self.view.top_line && l <= self.view.bottom_line { l } else { self.view.top_line }
+            }
+            _ => self.view.top_line,
+        };
+        let bytes = self.doc.line(line).1;
+        let bytes = if self.view.ansi { encoding::strip_ansi(bytes) } else { bytes.to_vec() };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        self.flash(format!("Copied line {} ({} characters)", self.orig_line(line) + 1, text.chars().count()));
+        self.clipboard = Some(text);
+    }
+
+    /// Lines of the `=` file information page.
+    fn info_lines(&self) -> Vec<String> {
+        let (doc, view) = match &self.view.derived {
+            Some(d) => (&d.base, &d.base_view),
+            None => (&self.doc, &self.view),
+        };
+        let mut v = vec!["FILE INFORMATION".to_string(), String::new()];
+        let mut row = |k: &str, val: String| v.push(format!("  {k:<14}{val}"));
+        row("Name", doc.name.clone());
+        let path = self.current_path().map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
+        if let Some(p) = &path {
+            row("Path", p.display().to_string());
+            if let Ok(m) = std::fs::metadata(p) {
+                row("Size", format!("{} bytes ({})", m.len(), crate::browser::human_size(m.len())));
+                if let Ok(t) = m.modified() {
+                    let t: chrono::DateTime<chrono::Local> = t.into();
+                    row("Modified", t.format("%Y-%m-%d %H:%M:%S").to_string());
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    row("Permissions", crate::usage::mode_string(m.permissions().mode()));
+                }
+            }
+        } else {
+            row("Source", "standard input".into());
+        }
+        if let Some(f) = &doc.filter {
+            row("Preprocessor", format!("{f} ({} bytes of output)", doc.len()));
+        }
+        let lines = doc.line_count();
+        row("Lines", lines.to_string());
+        let sample = &doc.bytes()[..doc.len().min(1 << 20)];
+        let lf = memchr::memchr_iter(b'\n', sample).count();
+        let crlf = memchr::memmem::find_iter(sample, b"\r\n").count();
+        row(
+            "Line endings",
+            match (lf, crlf) {
+                (0, _) => "none".into(),
+                (n, c) if c == n => "CRLF (Windows)".into(),
+                (_, 0) => "LF (Unix)".into(),
+                _ => "mixed LF and CRLF".into(),
+            },
+        );
+        row("Encoding", format!("{} (E cycles)", self.opts.encoding.label()));
+        let kind = if doc.looks_binary() {
+            "binary".to_string()
+        } else if let Some(t) = &view.table {
+            format!("{} table, {} columns", t.format.label, t.column_starts().len())
+        } else if let Some(h) = &view.hl {
+            format!("{} text", h.name())
+        } else {
+            "text".to_string()
+        };
+        row("Type", kind);
+        if view.ansi {
+            row("Colors", "ANSI escapes (C toggles)".into());
+        }
+        if let Some(d) = &self.view.derived {
+            for op in &d.ops {
+                row("Showing", op.label());
+            }
+            row("Shown", format!("{} of {lines} lines", d.map.len()));
+        }
+        v
+    }
+
+    /// Lines of the help or info page.
+    fn page_lines(&self) -> Vec<String> {
+        match self.mode {
+            Mode::Info { .. } => self.info_lines(),
+            _ => HELP.lines().map(String::from).collect(),
+        }
     }
 
     pub fn set_search(&mut self, pattern: &str) {
@@ -454,7 +763,13 @@ impl App {
         }
     }
 
+    /// Goes to line `n` (1-based) of the file. While filtered or sorted, the
+    /// first shown line at or after it.
     pub fn goto_line(&mut self, n: usize) {
+        let n = match &self.view.derived {
+            Some(d) => d.map.partition_point(|&l| l < n.saturating_sub(1)) + 1,
+            None => n,
+        };
         self.view.top_line = n.saturating_sub(1).min(self.doc.line_count() - 1);
         self.view.top_sub = 0;
     }
@@ -467,7 +782,8 @@ impl App {
 
     fn gutter_width(&self) -> usize {
         if self.opts.numbers && !self.view.hex {
-            self.doc.line_count().to_string().len() + 1
+            let count = self.view.derived.as_ref().map_or(self.doc.line_count(), |d| d.base.line_count());
+            count.to_string().len() + 1
         } else {
             0
         }
@@ -778,6 +1094,18 @@ impl App {
         if line < self.view.top_line || line > self.view.bottom_line || (line == self.view.top_line && self.view.top_sub > 0) {
             self.jump_to_offset(off, ctx);
         }
+        if let Some(t) = &self.view.table {
+            let (start, bytes) = self.doc.line(line);
+            if t.kind(line, bytes) != RowKind::Meta {
+                let rel = off - start;
+                let cells = t.row_cells(bytes, &|b, m| self.layout(b, m));
+                if let Some(k) = cells.iter().filter(|c| c.cell.byte >= rel).find_map(|c| c.col) {
+                    self.view.table.as_mut().expect("table view").cursor = k;
+                    self.show_cursor_column();
+                }
+                return self.normalize();
+            }
+        }
         if !self.wrap() {
             let (start, bytes) = self.doc.line(line);
             let rel = off - start;
@@ -836,7 +1164,8 @@ impl App {
         }
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Normal => self.key_normal(k),
-            Mode::Help { scroll } => self.key_help(k, scroll),
+            Mode::Help { scroll } => self.key_page(k, scroll, false),
+            Mode::Info { scroll } => self.key_page(k, scroll, true),
             Mode::Mark { set } => self.key_mark(k, set),
             Mode::Prompt { kind, input, hist } => self.key_prompt(k, kind, input, hist),
         }
@@ -914,7 +1243,19 @@ impl App {
                 self.normalize();
                 self.flash(if self.opts.wrap { "Wrap on" } else { "Wrap off" });
             }
-            KeyCode::Char('h' | 'H') => self.toggle_hex(),
+            KeyCode::Char('H') => self.toggle_hex(),
+            KeyCode::Char('&') => self.prompt(PromptKind::Filter),
+            KeyCode::Char('>') => self.sort_by_column(false),
+            KeyCode::Char('<') => self.sort_by_column(true),
+            KeyCode::Char('p' | 'P') if self.view.table.is_some() && !self.view.hex => {
+                let t = self.view.table.as_mut().expect("table view");
+                t.pin = !t.pin;
+                let on = t.pin;
+                self.flash(if on { "First column pinned" } else { "First column scrolls" });
+            }
+            KeyCode::Char('y') => self.copy(false),
+            KeyCode::Char('Y') => self.copy(true),
+            KeyCode::Char('=') => self.mode = Mode::Info { scroll: 0 },
             KeyCode::Char('e' | 'E') => {
                 self.opts.encoding = self.opts.encoding.next();
                 self.invalidate_layout();
@@ -960,7 +1301,7 @@ impl App {
             KeyCode::Char('[') if self.cur > 0 => self.switch_file(self.cur - 1),
             KeyCode::Char(']') => self.switch_file(self.cur + 1),
             KeyCode::Char('[') => {}
-            KeyCode::F(1) | KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
+            KeyCode::F(1) | KeyCode::Char('?' | 'h') => self.mode = Mode::Help { scroll: 0 },
             _ => {}
         }
     }
@@ -970,14 +1311,19 @@ impl App {
         // Terminals differ in which modifier they pass through with the wheel,
         // so any of them turns vertical wheel motion sideways.
         let sideways = m.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL);
-        if let Mode::Help { scroll } = self.mode {
-            let max = HELP.lines().count().saturating_sub(self.text_rows());
-            self.mode = match m.kind {
-                MouseEventKind::ScrollDown => Mode::Help { scroll: (scroll + 3).min(max) },
-                MouseEventKind::ScrollUp => Mode::Help { scroll: scroll.saturating_sub(3) },
-                MouseEventKind::Down(_) => Mode::Normal,
+        if let Mode::Help { scroll } | Mode::Info { scroll } = self.mode {
+            let info = matches!(self.mode, Mode::Info { .. });
+            let max = self.page_lines().len().saturating_sub(self.text_rows());
+            let scroll = match m.kind {
+                MouseEventKind::ScrollDown => (scroll + 3).min(max),
+                MouseEventKind::ScrollUp => scroll.saturating_sub(3),
+                MouseEventKind::Down(_) => {
+                    self.mode = Mode::Normal;
+                    return true;
+                }
                 _ => return false,
             };
+            self.mode = if info { Mode::Info { scroll } } else { Mode::Help { scroll } };
             return true;
         }
         if !matches!(self.mode, Mode::Normal) {
@@ -1022,6 +1368,9 @@ impl App {
         if self.doc.filter.is_some() {
             return self.error("Can't follow preprocessed input");
         }
+        if self.view.derived.is_some() {
+            return self.error("Can't follow while filtered or sorted (& then Enter shows all lines)");
+        }
         self.opts.follow = !self.opts.follow;
         if self.opts.follow {
             self.tick();
@@ -1032,8 +1381,8 @@ impl App {
         }
     }
 
-    fn key_help(&mut self, k: KeyEvent, scroll: usize) {
-        let max = HELP.lines().count().saturating_sub(self.text_rows());
+    fn key_page(&mut self, k: KeyEvent, scroll: usize, info: bool) {
+        let max = self.page_lines().len().saturating_sub(self.text_rows());
         let page = self.text_rows().saturating_sub(1).max(1);
         let scroll = match k.code {
             KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
@@ -1042,7 +1391,8 @@ impl App {
             KeyCode::PageDown | KeyCode::Char(' ') => scroll + page,
             _ => return,
         };
-        self.mode = Mode::Help { scroll: scroll.min(max) };
+        let scroll = scroll.min(max);
+        self.mode = if info { Mode::Info { scroll } } else { Mode::Help { scroll } };
     }
 
     fn key_mark(&mut self, k: KeyEvent, set: bool) {
@@ -1078,7 +1428,7 @@ impl App {
             KeyCode::Backspace => {
                 input.pop();
             }
-            KeyCode::Up if matches!(kind, PromptKind::Find(_)) && !self.history.is_empty() => {
+            KeyCode::Up if matches!(kind, PromptKind::Find(_) | PromptKind::Filter) && !self.history.is_empty() => {
                 let i = hist.map_or(self.history.len() - 1, |i| i.saturating_sub(1));
                 hist = Some(i);
                 input = self.history[i].clone();
@@ -1102,6 +1452,7 @@ impl App {
         match kind {
             PromptKind::Goto if input.trim().is_empty() => {}
             PromptKind::Goto => self.goto(&input),
+            PromptKind::Filter => self.apply_filter(&input),
             PromptKind::Find(dir) => {
                 let pattern = if input.is_empty() {
                     match self.history.last() {
@@ -1133,8 +1484,11 @@ impl App {
             queue!(out, terminal::Clear(terminal::ClearType::All))?;
             self.full_redraw = false;
         }
+        if let Some(text) = self.clipboard.take() {
+            queue!(out, Print(crate::external::osc52(&text)))?;
+        }
         match self.mode {
-            Mode::Help { scroll } => self.draw_help(out, scroll)?,
+            Mode::Help { scroll } | Mode::Info { scroll } => self.draw_page(out, scroll)?,
             _ if self.view.hex => self.draw_hex(out)?,
             _ if self.view.table.is_some() => {
                 self.normalize();
@@ -1213,7 +1567,7 @@ impl App {
                 }
                 let mut p = Painter::new(self.width);
                 if gw > 0 {
-                    let g = if ri == 0 { format!("{:>w$} ", line + 1, w = gw - 1) } else { " ".repeat(gw) };
+                    let g = if ri == 0 { format!("{:>w$} ", self.orig_line(line) + 1, w = gw - 1) } else { " ".repeat(gw) };
                     p.text(self.theme.gutter, &g);
                 }
                 let mut col = 0;
@@ -1300,7 +1654,43 @@ impl App {
         };
         let mut p = Painter::new(self.width);
         if gw > 0 {
-            p.text(self.theme.gutter, &format!("{:>w$} ", line + 1, w = gw - 1));
+            p.text(self.theme.gutter, &format!("{:>w$} ", self.orig_line(line) + 1, w = gw - 1));
+        }
+        let style_of = |tc: &TCell| {
+            let c = &tc.cell;
+            let base = match (kind, tc.col) {
+                (RowKind::Meta, _) => self.theme.hint,
+                _ if c.kind == CellKind::Special => self.theme.special,
+                (_, None) => self.theme.gutter,
+                // The cursor's column: highlighted in the header, or
+                // underlined throughout when there's no header.
+                (RowKind::Header, Some(k)) if k == t.cursor => Style { bold: true, ..self.theme.select },
+                (_, Some(k)) => {
+                    let mut s = self.theme.text;
+                    if t.colors {
+                        s.fg = self.theme.columns[k % self.theme.columns.len()];
+                    }
+                    if kind == RowKind::Header || (k == t.cursor && t.header.is_none()) {
+                        s.bold = kind == RowKind::Header;
+                        s.underline = true;
+                    }
+                    apply_ansi(s, &c.ansi)
+                }
+            };
+            if tc.col.is_some() || kind == RowKind::Meta { self.style_at(&matches, c.byte, base) } else { base }
+        };
+        // A pinned first column (and its separator) stays at the left.
+        let starts = t.column_starts();
+        if kind != RowKind::Meta && t.pin && starts.len() > 2 && hscroll >= starts[1] {
+            let mut col = 0;
+            for tc in &cells {
+                let w = tc.cell.width as usize;
+                if col + w > starts[1] || !p.put(style_of(tc), tc.cell.ch, w) {
+                    break;
+                }
+                col += w;
+            }
+            p.text(self.theme.text, &" ".repeat(starts[1].saturating_sub(col)));
         }
         let mut col = 0;
         for tc in &cells {
@@ -1311,23 +1701,7 @@ impl App {
             if col <= hscroll {
                 continue;
             }
-            let base = match (kind, tc.col) {
-                (RowKind::Meta, _) => self.theme.hint,
-                _ if c.kind == CellKind::Special => self.theme.special,
-                (_, None) => self.theme.gutter,
-                (_, Some(k)) => {
-                    let mut s = self.theme.text;
-                    if t.colors {
-                        s.fg = self.theme.columns[k % self.theme.columns.len()];
-                    }
-                    if kind == RowKind::Header {
-                        s.bold = true;
-                        s.underline = true;
-                    }
-                    apply_ansi(s, &c.ansi)
-                }
-            };
-            let style = if tc.col.is_some() || kind == RowKind::Meta { self.style_at(&matches, c.byte, base) } else { base };
+            let style = style_of(tc);
             if cstart < hscroll {
                 p.text(style, &" ".repeat(col - hscroll));
             } else if !p.put(style, c.ch, w) {
@@ -1371,8 +1745,8 @@ impl App {
         Ok(())
     }
 
-    fn draw_help(&self, out: &mut impl Write, scroll: usize) -> io::Result<()> {
-        let lines: Vec<&str> = HELP.lines().collect();
+    fn draw_page(&self, out: &mut impl Write, scroll: usize) -> io::Result<()> {
+        let lines = self.page_lines();
         for y in 0..self.text_rows() {
             let mut p = Painter::new(self.width);
             if let Some(l) = lines.get(scroll + y) {
@@ -1416,8 +1790,21 @@ impl App {
         if self.opts.follow {
             flags.push("FOLLOW");
         }
+        let ops: Vec<String> = self
+            .ops()
+            .iter()
+            .map(|o| match o {
+                Op::Filter { pattern, invert, .. } => format!("&{}{pattern}", if *invert { "!" } else { "" }),
+                Op::Sort { col, desc } => format!("col {}{}", col + 1, if *desc { "↓" } else { "↑" }),
+            })
+            .collect();
+        for o in ops.iter().rev() {
+            flags.insert(0, o.as_str());
+        }
         let right = if matches!(self.mode, Mode::Help { .. }) {
             "Help ".to_string()
+        } else if matches!(self.mode, Mode::Info { .. }) {
+            "File info ".to_string()
         } else if self.view.hex {
             let (_, end) = self.visible_range();
             let pct = if self.doc.len() == 0 { 100 } else { end * 100 / self.doc.len() };
@@ -1427,9 +1814,8 @@ impl App {
             let pct = (self.view.bottom_line + 1) * 100 / count;
             let col = match &self.view.table {
                 Some(t) => {
-                    let starts = t.column_starts();
-                    let k = starts.iter().filter(|&&x| x <= self.view.hscroll).count().max(1);
-                    format!("Column {k} of {}  ", starts.len())
+                    let name = t.column_name(&self.doc, t.cursor).map_or(String::new(), |n| format!(" ({n})"));
+                    format!("Column {}{name} of {}  ", t.cursor + 1, t.column_starts().len())
                 }
                 None if self.wrap() => String::new(),
                 None => format!("Col {}  ", self.view.hscroll + 1),
@@ -1466,6 +1852,7 @@ impl App {
                 PromptKind::Find(Dir::Backward) => "Find backward",
                 PromptKind::Goto if self.view.hex => "Go to offset (dec, 0xHEX, N%)",
                 PromptKind::Goto => "Go to line (N, N%, 0xOFFSET)",
+                PromptKind::Filter => "Show lines matching (!pattern: not matching; empty: all)",
             };
             let regex = if self.opts.regex && matches!(kind, PromptKind::Find(_)) { " [regex]" } else { "" };
             let label = format!("{label}{regex}: ");
@@ -1489,19 +1876,19 @@ impl App {
         match &self.message {
             Some((m, true)) => p.text(self.theme.error, m),
             Some((m, false)) => p.text(self.theme.text, m),
-            None if matches!(self.mode, Mode::Help { .. }) => {
+            None if matches!(self.mode, Mode::Help { .. } | Mode::Info { .. }) => {
                 p.text(self.theme.hint, " Up/Down/PgUp/PgDn scroll · any other key returns")
             }
             None if self.view.table.is_some() && !self.view.hex => p.text(
                 self.theme.hint,
-                " F1 Help  F Find  L Line  ←/→ Column  S Colors  D Text view  O Open  X Exit",
+                " h Help  & Filter  < > Sort  P Pin  S Colors  D Text  X Exit",
             ),
             None => p.text(
                 self.theme.hint,
                 if self.from_browser {
-                    " F1 Help  F Find  A Again  L Line  W Wrap  H Hex  O Open  X Back  Q Quit"
+                    " h Help  F Find  A Again  & Filter  L Line  w Wrap  H Hex  V Edit  X Back  Q Quit"
                 } else {
-                    " F1 Help  F Find  A Again  L Line  W Wrap  H Hex  O Open  B Browse  X Exit"
+                    " h Help  F Find  A Again  & Filter  L Line  w Wrap  H Hex  V Edit  B Browse  X Exit"
                 },
             ),
         }
@@ -1795,7 +2182,7 @@ mod tests {
         assert_eq!(s[2], "ann         │ 3   │ Paris, FR");
         assert_eq!(s[3], "bartholomew │ 41  │ Oslo");
         assert!(s[0].contains("CSV"), "status: {}", s[0]);
-        assert!(s[7].contains("D Text view"), "bottom: {}", s[7]);
+        assert!(s[7].contains("D Text"), "bottom: {}", s[7]);
     }
 
     #[test]
@@ -1848,22 +2235,44 @@ mod tests {
     }
 
     #[test]
-    fn arrows_move_by_column_and_search_reveals_the_column() {
+    fn arrows_move_the_column_cursor_and_scroll_only_when_needed() {
         let mut a = named("w.tsv", b"aaaaaaaaaa\tbbbbbbbbbb\tcccccccccc\tdddddddddd\tneedle\n");
+        assert!(screen(&mut a)[0].contains("Column 1 (aaaaaaaaaa) of 5"), "{}", screen(&mut a)[0]);
+        // Columns start at 0, 13, 26, 39 and 52; 30 columns fit on screen.
+        a.resize(30, 8);
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
-        assert!(screen(&mut a)[0].contains("Column 1 of 5"));
+        // Column 2 is already on screen: the cursor moves, nothing scrolls.
+        a.on_key(right);
+        assert_eq!((a.current_column(), a.view.hscroll), (Some(1), 0));
+        // Column 3 isn't: scroll just enough, keeping the pinned first column.
+        a.on_key(right);
+        assert_eq!(a.view.hscroll, 26);
+        assert!(screen(&mut a)[1].starts_with("aaaaaaaaaa │ cccccccccc"), "{:?}", screen(&mut a));
+        a.on_key(right);
+        assert_eq!(a.view.hscroll, 39);
+        a.on_key(right);
+        a.on_key(right);
+        assert_eq!(a.current_column(), Some(4), "stops at the last column");
+        // Going back scrolls only once the column is off screen.
+        a.on_key(left);
+        assert_eq!(a.view.hscroll, 39);
+        a.on_key(left);
+        assert_eq!(a.view.hscroll, 26);
+        a.on_key(left);
+        assert_eq!(a.view.hscroll, 0, "column 2 sits right after the pinned one");
+        a.on_key(left);
+        a.on_key(left);
+        assert_eq!((a.current_column(), a.view.hscroll), (Some(0), 0));
+        // Unpinned, column 3 needs less scrolling.
+        a.on_key(key('p'));
+        a.on_key(right);
         a.on_key(right);
         assert_eq!(a.view.hscroll, 13);
-        let s = screen(&mut a);
-        assert!(s[1].starts_with("bbbbbbbbbb │"));
-        assert!(s[0].contains("Column 2 of 5"), "status: {}", s[0]);
-        a.on_key(right);
-        a.on_key(left);
-        assert_eq!(a.view.hscroll, 13);
-        a.on_key(left);
-        assert_eq!(a.view.hscroll, 0);
+        assert!(screen(&mut a)[1].starts_with("bbbbbbbbbb │"));
+        // A search hit moves the cursor to its column.
         a.set_search("needle");
+        assert_eq!(a.current_column(), Some(4));
         assert!(screen(&mut a)[1].contains("needle"));
     }
 
@@ -1876,6 +2285,127 @@ mod tests {
         a.on_key(key('w'));
         assert!(!a.opts.wrap);
         assert!(matches!(&a.message, Some((m, false)) if m.contains("doesn't wrap")));
+    }
+
+    fn typed(a: &mut App, s: &str) {
+        for c in s.chars() {
+            a.on_key(key(c));
+        }
+    }
+
+    fn enter(a: &mut App) {
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn ampersand_filters_lines_and_keeps_line_numbers() {
+        let mut o = opts();
+        o.numbers = true;
+        let mut a = app(b"alpha 1\nbeta 2\nalpha 3\ngamma 4\n", o);
+        a.resize(40, 8);
+        typed(&mut a, "&alpha");
+        enter(&mut a);
+        let s = screen(&mut a);
+        assert_eq!(&s[1..4], ["1 alpha 1", "3 alpha 3", "~"], "{s:?}");
+        assert!(s[0].contains("&alpha"), "status shows the filter: {}", s[0]);
+        assert!(a.message.as_ref().is_some_and(|(m, _)| m.contains("Showing 2 of 4 lines")), "{:?}", a.message);
+        // L goes by the file's line numbers (on a screen small enough to scroll).
+        a.resize(40, 3);
+        typed(&mut a, "L3");
+        enter(&mut a);
+        assert_eq!(a.orig_line(a.view.top_line), 2);
+        a.resize(40, 8);
+
+        // Inverted.
+        typed(&mut a, "&!alpha");
+        enter(&mut a);
+        assert_eq!(&screen(&mut a)[1..3], ["2 beta 2", "4 gamma 4"]);
+        // No match changes nothing.
+        typed(&mut a, "&zzz");
+        enter(&mut a);
+        assert!(a.message.as_ref().is_some_and(|(m, err)| *err && m.contains("No lines match")));
+        assert_eq!(screen(&mut a)[1], "2 beta 2");
+        // & then Enter shows everything, back near the same place.
+        a.resize(40, 3);
+        typed(&mut a, "&");
+        enter(&mut a);
+        assert!(a.view.derived.is_none());
+        assert_eq!(a.doc.line_count(), 4);
+        assert_eq!(a.view.top_line, 1, "beta was at the top");
+        assert!(!screen(&mut a)[0].contains('&'));
+    }
+
+    #[test]
+    fn table_sorts_by_the_cursor_column() {
+        let csv = b"name,city,score\nann,Oslo,10\nbob,Paris,9\ncy,Lima,100\n";
+        let mut a = named("t.csv", csv);
+        a.resize(80, 8);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        // Column 2 (city): text.
+        a.on_key(right);
+        a.on_key(key('>'));
+        let s = screen(&mut a);
+        assert!(s[2].starts_with("cy") && s[3].starts_with("ann") && s[4].starts_with("bob"), "{s:?}");
+        assert!(s[0].contains("Column 2 (city) of 3"), "status: {}", s[0]);
+        // Column 3 (score): numbers by value.
+        a.on_key(right);
+        a.on_key(key('>'));
+        let s = screen(&mut a);
+        assert!(s[1].starts_with("name") && s[2].starts_with("bob") && s[4].starts_with("cy"), "{s:?}");
+        assert!(a.message.as_ref().is_some_and(|(m, _)| m.contains("column 3 (score)")), "{:?}", a.message);
+        a.on_key(key('<'));
+        assert!(screen(&mut a)[2].starts_with("cy"), "{:?}", screen(&mut a));
+        assert_eq!(a.current_column(), Some(2), "the cursor survives sorting");
+        // The same key again restores file order.
+        a.on_key(key('<'));
+        assert!(a.view.derived.is_none());
+        assert!(screen(&mut a)[2].starts_with("ann"));
+        // The pinned first column can be sorted too.
+        a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        a.on_key(key('<'));
+        assert!(screen(&mut a)[2].starts_with("cy"), "{:?}", screen(&mut a));
+        // Sorting needs table view.
+        let mut a = app(b"x\n", opts());
+        a.on_key(key('>'));
+        assert!(a.message.as_ref().is_some_and(|(_, err)| *err));
+    }
+
+    #[test]
+    fn y_copies_with_osc52() {
+        let mut a = app(b"first\nsecond line\n", opts());
+        a.on_key(key('y'));
+        let mut out = Vec::new();
+        a.draw(&mut out).unwrap();
+        let out = String::from_utf8_lossy(&out);
+        assert!(out.contains("\x1b]52;c;Zmlyc3Q=\x07"), "{out:?}");
+        // Only sent once.
+        let mut again = Vec::new();
+        a.draw(&mut again).unwrap();
+        assert!(!String::from_utf8_lossy(&again).contains("]52;"));
+        // The line with the current match wins.
+        typed(&mut a, "/second");
+        enter(&mut a);
+        a.on_key(key('y'));
+        assert_eq!(a.clipboard.as_deref(), Some("second line"));
+        a.on_key(key('Y'));
+        assert!(a.message.as_ref().is_some_and(|(m, err)| *err && m.contains("Standard input")));
+    }
+
+    #[test]
+    fn info_help_and_hex_keys() {
+        let mut a = named("t.csv", b"a,b\n1,2\n");
+        a.on_key(key('='));
+        a.resize(70, 20);
+        let s = screen(&mut a).join("\n");
+        assert!(s.contains("FILE INFORMATION") && s.contains("CSV table, 2 columns") && s.contains("LF (Unix)"), "{s}");
+        a.on_key(key('x'));
+        assert!(matches!(a.mode, Mode::Normal) && !a.quit, "any key closes the page");
+        a.on_key(key('h'));
+        assert!(matches!(a.mode, Mode::Help { .. }));
+        a.on_key(key('x'));
+        a.on_key(key('H'));
+        assert!(a.view.hex);
     }
 
     #[test]

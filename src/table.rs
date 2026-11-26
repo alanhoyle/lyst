@@ -190,6 +190,10 @@ pub struct Table {
     widths: Vec<usize>,
     /// Color each column differently.
     pub colors: bool,
+    /// Keep the first column in view when scrolling sideways.
+    pub pin: bool,
+    /// The selected column (0-based), which sorting uses.
+    pub cursor: usize,
 }
 
 impl Table {
@@ -211,7 +215,7 @@ impl Table {
             }
             Header::None => None,
         };
-        let mut t = Table { format, header, widths: Vec::new(), colors: true };
+        let mut t = Table { format, header, widths: Vec::new(), colors: true, pin: true, cursor: 0 };
         // Size the columns from the start of the file; rows seen later can widen them.
         let mut bytes = 0;
         for i in 0..doc.line_count().min(1000) {
@@ -225,6 +229,16 @@ impl Table {
             }
         }
         t
+    }
+
+    /// True for lines shown as plain text rather than as a row.
+    pub fn is_meta(&self, bytes: &[u8]) -> bool {
+        self.format.is_meta(bytes)
+    }
+
+    /// The contents of column `k` (0-based) of a line; empty if it's short.
+    pub fn field<'a>(&self, line: &'a [u8], k: usize) -> &'a [u8] {
+        self.split(line).get(k).map_or(&[], |f| &line[f.start..f.end])
     }
 
     pub fn kind(&self, line: usize, bytes: &[u8]) -> RowKind {
@@ -253,6 +267,18 @@ impl Table {
     }
 
     /// Screen column where each column starts.
+    /// Display width of column `k` so far.
+    pub fn column_width(&self, k: usize) -> usize {
+        self.widths.get(k).copied().unwrap_or(0)
+    }
+
+    /// The name of column `k` from the header line, if there is one.
+    pub fn column_name(&self, doc: &Document, k: usize) -> Option<String> {
+        let h = self.header?;
+        let name = String::from_utf8_lossy(self.field(doc.line(h).1, k)).trim_start_matches('#').trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
     pub fn column_starts(&self) -> Vec<usize> {
         let mut x = 0;
         self.widths

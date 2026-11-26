@@ -248,6 +248,26 @@ fn default_browser_command(path: &Path, url: &str) -> io::Result<Command> {
     Ok(c)
 }
 
+/// The escape sequence asking the terminal to put `text` on the clipboard
+/// (OSC 52). Most terminals support it, also over SSH; tmux needs
+/// `set -g set-clipboard on`.
+pub fn osc52(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
+}
+
+fn base64(data: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            out.push(if i <= chunk.len() { A[(n >> shift & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
 /// The user's editor: `$VISUAL`, then `$EDITOR`, then `vi` (Notepad on
 /// Windows, which has no convention of its own). It may include arguments,
 /// like `code --wait`.
@@ -309,6 +329,16 @@ fn binary_bytes(b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_sequence() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64("héllo wörld".as_bytes()), "aMOpbGxvIHfDtnJsZA==");
+        assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x07");
+    }
 
     #[test]
     fn file_urls() {

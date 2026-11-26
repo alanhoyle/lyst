@@ -20,21 +20,25 @@ some-command | lyst
 ## Features
 
 - File browser like LIST's opening screen: `..`, directories, then files with
-  size and date. Arrows/PgUp/PgDn/Home/End to move, Enter to view, ← or
-  Backspace to go up, `/` then the start of a name to jump to it (`/` again
-  for the next match, Enter to open, Esc to stop), `J` to type a directory
-  to go to, with suggestions as you type and Tab completion (Tab again or
-  ↑/↓ step through them; `~` and relative paths work, and a file's path
-  opens its directory with the file selected), `U` disk usage of the
-  selected file or directory (counted in the background, like `du`),
-  `F2` sort (name/extension/size/date), `F3` dotfiles, `~` home,
-  `O` (capital) opens the selection in its default application, `Q` or Esc
-  quits.
-  `F4` switches between one line per file (size and date) and a compact
-  multi-column view (start in it with `--wide`); in columns, arrows move
-  through the grid and Backspace goes up a directory.
-  From the viewer, `X`/Esc returns to the list, `[`/`]` step through the
-  directory's files, `B` opens the browser at the current file, `Q` quits
+  size and date. `h` shows all its keys.
+  - Arrows/PgUp/PgDn/Home/End move, Enter views, ← or Backspace goes up,
+    `~` goes home, `Q` or Esc quits
+  - `/` then the start of a name jumps to it (`/` again for the next match)
+  - `F` finds files and directories by name anywhere below the current
+    directory, searching in the background as you type; every word typed
+    must appear in the path
+  - `J` prompts for a directory to go to, with suggestions and Tab
+    completion; left empty, it lists recently visited directories, which are
+    remembered between runs (in `~/.local/state/lyst/dirs`, the only file
+    lyst writes). `-` goes back to the previous directory
+  - Space tags files; Enter then views just the tagged ones, with `[`/`]`
+    stepping through them. Esc clears the tags
+  - `U` totals the disk usage of the selection in the background, like `du`;
+    `Y` copies its full path
+  - `F2` sorts by name, extension, size or date, `F3` shows dotfiles, and
+    `F4` switches to a compact multi-column view (start in it with `--wide`)
+  - From the viewer, `X`/Esc returns to the list, `[`/`]` step through the
+    directory's files, and `B` opens the browser at the current file
 - `O` opens the file you're viewing in the OS's default application
   (`open` on macOS, `xdg-open` on Linux, `start` on Windows)
 - `V` edits the file you're viewing (`E` or `V` in the browser) in
@@ -60,17 +64,29 @@ some-command | lyst
   GTF/GFF and SAM, including compressed ones like `calls.vcf.gz` opened through
   a preprocessor. `D` toggles it for any file, guessing the separator (tab,
   comma, semicolon or `|`). Columns line up and get alternating colors (`S`
-  toggles them), ←/→ move a column at a time, and the header row stays pinned
+  toggles them), ←/→ select a column, scrolling to it as needed, and the header row stays pinned
   at the top as you scroll. Metadata lines (`##` in VCF, `@` in SAM,
   `track`/`browser` in BED) are shown as plain text, and the `#CHROM` or
   `#chrom` line is used as the header. Fields wider than 40 columns are cut
   off with `…`. CSV quoting is handled within a line, but a quoted field
-  containing a line break ends the row there
+  containing a line break ends the row there. The first column stays in
+  view as you scroll right (`P` toggles). `<` and `>` sort the rows by the
+  selected column (←/→ move the selection, shown highlighted in the header),
+  descending or ascending: numbers by value, and
+  text naturally, so `chr2` comes before `chr10`
+- `&` shows only the lines matching a pattern (`&!pattern`: lines that
+  don't match), like `less`; `&` then Enter shows all lines again. Line
+  numbers stay those of the file, and in a table the header stays
+- `y` copies the current line (the one with the search match, else the top
+  line), `Y` the file's path, using the terminal's clipboard (OSC 52), so
+  it works over SSH too
+- `=` shows file information: path, size, modification time, permissions,
+  line count, line endings and type
 - ANSI color escapes rendered as colors when present (like `less -R`),
   e.g. `git log --color | lyst`; `C` toggles, `--no-ansi` disables
 - Opens huge files instantly (memory-mapped, line index built with `memchr`)
 - Single-key LIST-style commands: `F` find, `A` again, `L` go to line, `w` wrap,
-  `H` hex, `X` exit; vi-style `j`/`k`/`g`/`G`/`/`/`n`/`N` also work
+  `H` hex, `X` exit, `h` help; vi-style `j`/`k`/`g`/`G`/`/`/`n`/`N` also work
 - Literal or regex search (`R`), smart case, match highlighting, wraps around
 - Hex dump mode, chosen automatically for binary files
 - Encodings: UTF-8, **CP437** (real DOS box-drawing and smiley glyphs), Latin-1,
@@ -106,5 +122,5 @@ git clone https://github.com/bioSyntax/bioSyntax-sublime ~/.config/lyst/syntaxes
 lyst --list-syntaxes     # user syntaxes are marked *, problems are listed
 ```
 
-Press `F1` or `?` in the viewer for the full key list, or run `lyst --help` for
+Press `h`, `F1` or `?` in the viewer or browser for the full key list, or run `lyst --help` for
 the command-line options.

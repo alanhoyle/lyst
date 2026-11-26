@@ -88,9 +88,9 @@ Type "s"
 Sleep 1.5s
 Type "s"
 Sleep 1.2s
-Type "h"
+Type "H"
 Sleep 2.2s
-Type "h"
+Type "H"
 Sleep 1s
 
 Type "q"

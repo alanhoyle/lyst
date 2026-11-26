@@ -16,11 +16,24 @@ pub struct DirPrompt {
     pub matches: Vec<String>,
     /// The highlighted suggestion, whose text is then in `input`.
     pub sel: Option<usize>,
+    /// Recently visited directories, offered while the input is empty.
+    recent: Vec<String>,
+    /// True while `matches` are the recent directories.
+    pub showing_recent: bool,
 }
 
 impl DirPrompt {
-    pub fn new(base: &Path, show_hidden: bool) -> Self {
-        let mut p = DirPrompt { input: String::new(), base: base.to_path_buf(), show_hidden, matches: Vec::new(), sel: None };
+    /// `recent` are directories as typed (`~/src/`), most recent first.
+    pub fn new(base: &Path, show_hidden: bool, recent: Vec<String>) -> Self {
+        let mut p = DirPrompt {
+            input: String::new(),
+            base: base.to_path_buf(),
+            show_hidden,
+            matches: Vec::new(),
+            sel: None,
+            recent,
+            showing_recent: false,
+        };
         p.refresh();
         p
     }
@@ -34,7 +47,12 @@ impl DirPrompt {
     /// Recomputes the suggestions for the input as typed.
     fn refresh(&mut self) {
         self.sel = None;
-        self.matches = suggestions(&self.input, &self.base, self.show_hidden);
+        self.showing_recent = self.input.is_empty() && !self.recent.is_empty();
+        self.matches = if self.showing_recent {
+            self.recent.clone()
+        } else {
+            suggestions(&self.input, &self.base, self.show_hidden)
+        };
     }
 
     pub fn push(&mut self, c: char) {
@@ -65,7 +83,7 @@ impl DirPrompt {
     /// Tab: completes as far as the suggestions agree, goes into the only
     /// match, or else steps through the suggestions.
     pub fn complete(&mut self) {
-        if self.sel.is_some() {
+        if self.sel.is_some() || self.showing_recent {
             return self.step(1);
         }
         match self.matches.len() {
@@ -175,7 +193,7 @@ mod tests {
     #[test]
     fn suggests_directories_only_and_hides_dotfiles() {
         let dir = tree("suggest");
-        let p = DirPrompt::new(&dir, false);
+        let p = DirPrompt::new(&dir, false, Vec::new());
         assert_eq!(p.matches, ["docs/", "Samples/", "scratch/", "src/"]);
         assert_eq!(suggestions("s", &dir, false), ["Samples/", "scratch/", "src/"], "no setup.py");
         assert_eq!(suggestions("S", &dir, false), ["Samples/", "scratch/", "src/"], "ignores case");
@@ -189,7 +207,7 @@ mod tests {
     #[test]
     fn tab_completes_then_cycles() {
         let dir = tree("tab");
-        let mut p = DirPrompt::new(&dir, false);
+        let mut p = DirPrompt::new(&dir, false, Vec::new());
         p.push('d');
         p.complete();
         assert_eq!(p.input, "docs/", "the only match");
@@ -225,6 +243,28 @@ mod tests {
         assert_eq!(p.input, "sc");
         p.complete();
         assert_eq!(p.input, "scratch/");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_input_offers_recent_directories() {
+        let dir = tree("recent");
+        let recent = vec!["~/elsewhere/".to_string(), "/opt/x/".to_string()];
+        let mut p = DirPrompt::new(&dir, false, recent.clone());
+        assert!(p.showing_recent);
+        assert_eq!(p.matches, recent);
+        // Tab steps through them rather than completing their common "~".
+        p.complete();
+        assert_eq!((p.input.as_str(), p.sel), ("~/elsewhere/", Some(0)));
+        p.step(1);
+        assert_eq!(p.input, "/opt/x/");
+        // Typing switches to completing names here; erasing brings them back.
+        p.clear();
+        p.push('s');
+        assert!(!p.showing_recent);
+        assert_eq!(p.matches, ["Samples/", "scratch/", "src/"]);
+        p.backspace();
+        assert!(p.showing_recent);
         let _ = fs::remove_dir_all(&dir);
     }
 

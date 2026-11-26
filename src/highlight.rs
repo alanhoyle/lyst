@@ -12,7 +12,7 @@ use two_face::theme::EmbeddedLazyThemeSet;
 /// Lines per parser checkpoint.
 const STRIDE: usize = 256;
 /// How far back (in chunks) to look for an exact parser state before starting
-/// fresh. Starting fresh is usually right, since most syntaxes resynchronise
+/// fresh. Starting fresh is usually right, since most syntaxes resynchronize
 /// at line starts; long block comments or strings may be off until scrolled through.
 const MAX_CATCHUP: usize = 16;
 /// Lines longer than this (e.g. minified files) are shown unhighlighted.

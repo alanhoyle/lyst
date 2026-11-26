@@ -200,7 +200,7 @@ struct View {
     marks: HashMap<char, usize>,
     /// Last line drawn on the previous frame.
     bottom_line: usize,
-    /// Syntax highlighter, if a syntax was recognised for this file.
+    /// Syntax highlighter, if a syntax was recognized for this file.
     hl: Option<DocHighlighter>,
     /// Interpret ANSI escape sequences as colors.
     ansi: bool,
@@ -875,7 +875,7 @@ impl App {
                         "Syntax highlighting on, but this file's own ANSI colors are shown (C turns them off)".to_string()
                     }
                     (Some(h), true) => format!("Syntax highlighting on ({})", h.name()),
-                    (None, true) => "Syntax highlighting on (no syntax recognised for this file)".to_string(),
+                    (None, true) => "Syntax highlighting on (no syntax recognized for this file)".to_string(),
                 };
                 self.flash(msg);
             }

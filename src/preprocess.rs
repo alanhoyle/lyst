@@ -45,8 +45,8 @@ fn feedback() -> Feedback {
     }
 }
 
-fn cancelled_error() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "Cancelled")
+fn canceled_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "Canceled")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -87,7 +87,7 @@ fn global() -> Option<&'static Preprocessor> {
 }
 
 /// Filters a file. Returns the replacement contents and a label, or `None`
-/// to show the original file. Fails only if the user cancelled.
+/// to show the original file. Fails only if the user canceled.
 pub fn file(path: &Path) -> io::Result<Option<(Vec<u8>, String)>> {
     let Some(p) = global() else { return Ok(None) };
     match p.run_file(path) {
@@ -177,7 +177,7 @@ fn run(mut cmd: Command, input: Option<&[u8]>, label: &str, name: &str) -> io::R
         .stdout(Stdio::piped())
         // stderr would scribble over the full-screen display.
         .stderr(Stdio::null());
-    // Own process group, so cancelling also stops helpers like tar and gzip.
+    // Own process group, so canceling also stops helpers like tar and gzip.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn()?;
@@ -213,7 +213,7 @@ fn run(mut cmd: Command, input: Option<&[u8]>, label: &str, name: &str) -> io::R
             kill_tree(&mut child);
             let _ = reader.join();
             progress.clear();
-            return Err(cancelled_error());
+            return Err(canceled_error());
         }
     };
     let stdout = reader.join().unwrap_or_default();

@@ -1,0 +1,22 @@
+{
+  "version": "0.2",
+  "language": "en",
+  "words": [
+    "Buerg",
+    "chrom",
+    "csvlook",
+    "cstart",
+    "docstrings",
+    "fileformat",
+    "LESSOPEN",
+    "lesspipe",
+    "lyst",
+    "peekable",
+    "rustc",
+    "segs",
+    "UCSC"
+  ],
+  "ignoreRegExpList": [
+    "/\\\\[tnr]/g"
+  ]
+}

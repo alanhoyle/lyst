@@ -111,7 +111,7 @@ impl AnsiStyle {
     }
 }
 
-/// If `s` starts with a recognised escape sequence, returns its length and,
+/// If `s` starts with a recognized escape sequence, returns its length and,
 /// for SGR sequences, the parameter bytes.
 fn escape_len(s: &[u8]) -> Option<(usize, Option<&[u8]>)> {
     match s.get(1)? {

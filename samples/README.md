@@ -11,6 +11,7 @@ Small files for trying lyst's table view by hand (`lyst samples/people.csv`).
 | `semicolons.txt` | No known extension: press `D` and lyst guesses the `;` separator |
 | `inventory.py` | Python syntax highlighting: shebang, docstrings, decorators, f-strings, type hints |
 | `peaks.rs` | Rust syntax highlighting: lifetimes, enums, `match`, closures, doc comments, a test module |
+| `project.zip`, `project.tar`, `project.tar.gz` | Archive listings: the same small project (some of these files, three directories, a symlink in the tars, and a name longer than a plain tar header holds) |
 
 The two source files are real programs that work on the data files here:
 `python3 samples/inventory.py` reads `semicolons.txt`, and

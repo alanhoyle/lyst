@@ -90,6 +90,12 @@ some-command | lyst
 - Single-key LIST-style commands: `F` find, `A` again, `L` go to line, `w` wrap,
   `H` hex, `X` exit, `h` help; vi-style `j`/`k`/`g`/`G`/`/`/`n`/`N` also work
 - Literal or regex search (`R`), smart case, match highlighting, wraps around
+- Zip, tar and tar.gz archives show their table of contents, like
+  `unzip -l` or `tar -tvf`, without extracting anything: a table of mode,
+  owner, size, compressed size (zip), date and name, so `<`/`>` sort it and
+  `&` filters it. Archives are recognized by their contents, not their
+  names, and take priority over a preprocessor. A large `.tar.gz` shows
+  progress while it's read, and Esc cancels
 - Hex dump mode, chosen automatically for binary files
 - Encodings: UTF-8, **CP437** (real DOS box-drawing and smiley glyphs), Latin-1,
   and 7-bit (strips the high bit, for old WordStar files). Cycle with `E`

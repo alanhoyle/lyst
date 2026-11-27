@@ -11,7 +11,7 @@ use crossterm::style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor
 use crossterm::{cursor, queue, terminal};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthStr;
 
 pub const HELP: &str = "\
@@ -180,26 +180,50 @@ impl Source {
                 let (v, filter) = crate::preprocess::stdin(v)?;
                 Ok(Document::from_bytes("<stdin>", v).filtered(filter))
             }
-            Source::Path(p) if crate::table::reads_directly(&p.to_string_lossy()) => Document::open(p),
-            Source::Path(p) => match crate::preprocess::file(p)? {
-                Some((bytes, filter)) => {
-                    // Preprocessors such as lesspipe pass plain text through
-                    // unchanged, or only add colors (lesspipe runs bat when
-                    // LESS has -R). Use the original file then, so it stays
-                    // memory-mapped and keeps follow mode and our own syntax
-                    // highlighting, which S can toggle.
-                    if let Ok(orig) = Document::open(p)
-                        && (orig.bytes() == bytes.as_slice()
-                            || (memchr::memchr(0x1b, &bytes).is_some()
-                                && encoding::strip_ansi(&bytes) == orig.bytes()))
-                    {
-                        return Ok(orig);
+            Source::Path(p) => match crate::archive::detect(p) {
+                Some(kind) => {
+                    let path = p.clone();
+                    let listed = crate::preprocess::with_progress("Listing", &p.to_string_lossy(), move |cancel| {
+                        crate::archive::listing(&path, kind, cancel)
+                    })?;
+                    match listed {
+                        Ok(bytes) => {
+                            let mut d = Document::from_bytes(p.display().to_string(), bytes);
+                            d.archive = Some(kind.label());
+                            Ok(d)
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
+                        // Not readable as an archive after all: show the file.
+                        Err(_) => load_file(p),
                     }
-                    Ok(Document::from_bytes(p.display().to_string(), bytes).filtered(Some(filter)))
                 }
-                None => Document::open(p),
+                None => load_file(p),
             },
         }
+    }
+}
+
+/// Loads a file as it is, or as its input preprocessor presents it.
+fn load_file(p: &Path) -> io::Result<Document> {
+    if crate::table::reads_directly(&p.to_string_lossy()) {
+        return Document::open(p);
+    }
+    match crate::preprocess::file(p)? {
+        Some((bytes, filter)) => {
+            // Preprocessors such as lesspipe pass plain text through
+            // unchanged, or only add colors (lesspipe runs bat when
+            // LESS has -R). Use the original file then, so it stays
+            // memory-mapped and keeps follow mode and our own syntax
+            // highlighting, which S can toggle.
+            if let Ok(orig) = Document::open(p)
+                && (orig.bytes() == bytes.as_slice()
+                    || (memchr::memchr(0x1b, &bytes).is_some() && encoding::strip_ansi(&bytes) == orig.bytes()))
+            {
+                return Ok(orig);
+            }
+            Ok(Document::from_bytes(p.display().to_string(), bytes).filtered(Some(filter)))
+        }
+        None => Document::open(p),
     }
 }
 
@@ -242,8 +266,11 @@ impl View {
         let ansi = opts.ansi && doc.has_ansi();
         // A preprocessor may have laid the table out already (lesspipe runs
         // csvlook on .csv.gz); only add our own if the separator survived.
-        let named = Format::for_name(&doc.name)
-            .filter(|f| doc.filter.is_none() || Format::sniff(doc).is_some_and(|s| s.same_separator(f)));
+        let named = match doc.archive {
+            Some(kind) => Some(Format::listing(kind)),
+            None => Format::for_name(&doc.name)
+                .filter(|f| doc.filter.is_none() || Format::sniff(doc).is_some_and(|s| s.same_separator(f))),
+        };
         let table = match named {
             Some(f) if !hex => Some(Table::new(doc, f, &|b: &[u8], max| {
                 encoding::layout(b, opts.encoding, opts.tab, max, ansi)
@@ -724,7 +751,9 @@ impl App {
             },
         );
         row("Encoding", format!("{} (E cycles)", self.opts.encoding.label()));
-        let kind = if doc.looks_binary() {
+        let kind = if let Some(a) = doc.archive {
+            format!("{a} archive (its contents listed, not extracted)")
+        } else if doc.looks_binary() {
             "binary".to_string()
         } else if let Some(t) = &view.table {
             format!("{} table, {} columns", t.format.label, t.column_starts().len())
@@ -1376,6 +1405,9 @@ impl App {
         }
         if self.doc.filter.is_some() {
             return self.error("Can't follow preprocessed input");
+        }
+        if self.doc.archive.is_some() {
+            return self.error("Can't follow an archive listing");
         }
         if self.view.derived.is_some() {
             return self.error("Can't follow while filtered or sorted (& then Enter shows all lines)");

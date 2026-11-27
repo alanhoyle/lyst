@@ -22,6 +22,8 @@ pub struct Document {
     pub name: String,
     /// Name of the input preprocessor that produced this content, if any.
     pub filter: Option<String>,
+    /// Set when this is an archive's table of contents ("zip", "tar.gz").
+    pub archive: Option<&'static str>,
     path: Option<PathBuf>,
     data: Data,
     /// Byte offset of the start of every line. Always contains at least `0`.
@@ -34,6 +36,7 @@ impl Document {
         let mut d = Document {
             name: path.display().to_string(),
             filter: None,
+            archive: None,
             path: Some(path.to_owned()),
             data,
             line_starts: vec![0],
@@ -46,6 +49,7 @@ impl Document {
         let mut d = Document {
             name: name.into(),
             filter: None,
+            archive: None,
             path: None,
             data: Data::Owned(bytes),
             line_starts: vec![0],

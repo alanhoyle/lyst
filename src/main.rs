@@ -1,4 +1,5 @@
 mod app;
+mod archive;
 mod browser;
 mod doc;
 mod encoding;

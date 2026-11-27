@@ -13,8 +13,8 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// How long a preprocessor may run before we show that we're waiting on it.
@@ -222,6 +222,35 @@ fn run(mut cmd: Command, input: Option<&[u8]>, label: &str, name: &str) -> io::R
     }
     progress.clear();
     Ok((status, stdout))
+}
+
+/// Runs `work` on a thread, showing the same progress as a slow
+/// preprocessor. Esc or Ctrl-C sets the flag `work` is given and returns
+/// an `Interrupted` error once `work` notices it and returns.
+pub fn with_progress<T: Send + 'static>(
+    label: &str,
+    name: &str,
+    work: impl FnOnce(&AtomicBool) -> T + Send + 'static,
+) -> io::Result<T> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancel);
+    let handle = std::thread::spawn(move || work(&flag));
+    let start = Instant::now();
+    let mut progress = Progress { frame: 0, shown: false };
+    while !handle.is_finished() {
+        let elapsed = start.elapsed();
+        if elapsed >= SHOW_AFTER {
+            progress.show(label, name, elapsed);
+        }
+        if wait_for_cancel(Duration::from_millis(50)) {
+            cancel.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+            progress.clear();
+            return Err(canceled_error());
+        }
+    }
+    progress.clear();
+    handle.join().map_err(|_| io::Error::other(format!("{label} failed")))
 }
 
 /// Sleeps up to `d`; on screen, returns true early if Esc or Ctrl-C is pressed.

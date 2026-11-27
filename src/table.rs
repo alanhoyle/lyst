@@ -10,6 +10,8 @@ use memchr::memchr;
 
 /// Widest a column grows before its fields are cut off with `…`.
 pub const MAX_WIDTH: usize = 40;
+/// Widest the last column of an archive listing (the entry name) grows.
+const LONG_WIDTH: usize = 1000;
 /// Between columns.
 pub const SEP: &str = " │ ";
 const SEP_WIDTH: usize = 3;
@@ -33,10 +35,12 @@ pub struct Format {
     /// Lines starting with any of these are shown as plain text.
     meta: &'static [&'static [u8]],
     header: Header,
+    /// The last column isn't cut at MAX_WIDTH (an archive listing's names).
+    wide_last: bool,
 }
 
 const fn fmt(label: &'static str, delim: u8, quotes: bool, meta: &'static [&'static [u8]], header: Header) -> Format {
-    Format { label, delim, quotes, meta, header }
+    Format { label, delim, quotes, meta, header, wide_last: false }
 }
 
 const CSV: Format = fmt("CSV", b',', true, &[], Header::First);
@@ -107,6 +111,17 @@ impl Format {
             }
         }
         best.map(|(_, _, f)| f)
+    }
+
+    /// An archive's table of contents (see `archive.rs`): tab-separated,
+    /// `#` summary lines, a header row, and names in the last column.
+    pub fn listing(label: &'static str) -> Format {
+        Format { wide_last: true, ..fmt(label, b'\t', false, &[b"#"], Header::First) }
+    }
+
+    /// Widest column `k` of `n` grows.
+    fn max_width(&self, k: usize, n: usize) -> usize {
+        if self.wide_last && k + 1 == n { LONG_WIDTH } else { MAX_WIDTH }
     }
 
     pub fn same_separator(&self, other: &Format) -> bool {
@@ -257,8 +272,10 @@ impl Table {
 
     /// Widens columns to fit this row.
     pub fn measure(&mut self, line: &[u8], lay: &Lay) {
-        for (k, f) in self.split(line).iter().enumerate() {
-            let w = field_cells(line, f, lay).iter().map(|c| c.width as usize).sum::<usize>().clamp(1, MAX_WIDTH);
+        let fields = self.split(line);
+        for (k, f) in fields.iter().enumerate() {
+            let max = self.format.max_width(k, fields.len());
+            let w = field_cells(line, f, lay, max).iter().map(|c| c.width as usize).sum::<usize>().clamp(1, max);
             match self.widths.get_mut(k) {
                 Some(cur) => *cur = (*cur).max(w),
                 None => self.widths.push(w),
@@ -302,9 +319,10 @@ impl Table {
                 let byte = f.raw_start.saturating_sub(1);
                 out.extend(SEP.chars().map(|ch| TCell { cell: plain(ch, byte), col: None }));
             }
-            let cells = field_cells(line, f, lay);
+            let max = self.format.max_width(k, fields.len());
+            let cells = field_cells(line, f, lay, max);
             let natural: usize = cells.iter().map(|c| c.width as usize).sum();
-            let width = self.widths.get(k).copied().unwrap_or(natural.clamp(1, MAX_WIDTH));
+            let width = self.widths.get(k).copied().unwrap_or(natural.clamp(1, max));
             let col = Some(k);
             let mut used = 0;
             if natural > width {
@@ -330,10 +348,10 @@ impl Table {
 }
 
 /// Cells for a field's displayed text, with `""` shown as one quote.
-fn field_cells(line: &[u8], f: &Field, lay: &Lay) -> Vec<Cell> {
+fn field_cells(line: &[u8], f: &Field, lay: &Lay, max: usize) -> Vec<Cell> {
     let inner = &line[f.start..f.end];
-    // Long fields are cut at MAX_WIDTH anyway; don't lay out megabytes.
-    let mut cells = lay(inner, MAX_WIDTH * 2 + 2);
+    // Long fields are cut at `max` anyway; don't lay out megabytes.
+    let mut cells = lay(inner, max * 2 + 2);
     for c in &mut cells {
         c.byte += f.start;
     }
@@ -366,7 +384,7 @@ mod tests {
         let b = line.as_bytes();
         split(b, delim, quotes)
             .iter()
-            .map(|f| field_cells(b, f, &lay).iter().map(|c| c.ch).collect())
+            .map(|f| field_cells(b, f, &lay, MAX_WIDTH).iter().map(|c| c.ch).collect())
             .collect()
     }
 
@@ -394,7 +412,7 @@ mod tests {
     fn unquoting_keeps_byte_offsets() {
         let b = br#"1,"a""b""#;
         let f = split(b, b',', true);
-        let cells = field_cells(b, &f[1], &lay);
+        let cells = field_cells(b, &f[1], &lay, MAX_WIDTH);
         let bytes: Vec<usize> = cells.iter().map(|c| c.byte).collect();
         assert_eq!(bytes, [3, 4, 6], "a, the first quote of the pair, b");
     }

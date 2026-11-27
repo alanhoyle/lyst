@@ -2,8 +2,10 @@
 name = "lyst"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 description = "A modern take on Vernon Buerg's LIST file viewer"
 license = "MIT"
+repository = "https://github.com/alanhoyle/lyst"
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

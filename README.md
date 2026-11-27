@@ -3,14 +3,36 @@
 A modern, Rust tool inspired by Vernon Buerg's classic DOS file viewer **LIST**: a fast,
 read-only pager with single-key commands, a status line, hex view, and search.
 
-![lyst browsing the sample files: a CSV and a VCF in table view, a search, then Rust syntax highlighting and the hex view](demo/lyst.gif)
+![lyst browsing the sample files: a CSV and a VCF in table view, filtering and sorting, Rust syntax highlighting and the hex view, then a VCF opened from inside a tar.gz](demo/lyst.gif)
 
 *Recorded with [VHS](https://github.com/charmbracelet/vhs) from
 [demo/demo.tape](demo/demo.tape); rerun `vhs demo/demo.tape` after a release
 build to update it.*
 
+## Install
+
+Download a binary for Linux (x86_64 or arm64; static, for any distribution),
+macOS (Apple Silicon or Intel) or Windows from the
+[latest release](https://github.com/alanhoyle/lyst/releases/latest), unpack
+it, and put `lyst` (or `lyst.exe`) somewhere on your `PATH`. `SHA256SUMS`
+lists each download's checksum.
+
+macOS marks files downloaded in a browser as quarantined, and the binary
+isn't signed, so the first run is refused. Clear the mark with:
+
 ``` shell
-cargo install --path .
+xattr -d com.apple.quarantine lyst
+```
+
+Or build it with [Rust](https://rustup.rs) (1.95 or later):
+
+``` shell
+cargo install --git https://github.com/alanhoyle/lyst
+```
+
+## Usage
+
+``` shell
 lyst                 # browse the current directory
 lyst ~/src           # browse a directory
 lyst file.txt other.log

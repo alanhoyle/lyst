@@ -271,6 +271,13 @@ fn run(app: &mut Ui) -> io::Result<()> {
                 enter_terminal(app.mouse)?;
                 app.edited(&path, result);
             }
+            if let Some(dir) = app.take_shell() {
+                // Likewise for a shell, on the normal screen.
+                leave_terminal();
+                let result = external::subshell(&dir);
+                enter_terminal(app.mouse)?;
+                app.shell_done(result);
+            }
             // A slow preprocessor (or the editor) may have swallowed a resize.
             let now = terminal::size()?;
             if now != size {

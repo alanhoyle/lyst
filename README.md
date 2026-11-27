@@ -36,6 +36,9 @@ some-command | lyst
     stepping through them. Esc clears the tags
   - `U` totals the disk usage of the selection in the background, like `du`;
     `Y` copies its full path
+  - `#` starts a shell (`$SHELL`, or `cmd` on Windows) in the current
+    directory; exiting it returns to the browser, rereading the directory.
+    `LYST_SHELL=1` is set in that shell
   - `F2` sorts by name, extension, size or date, `F3` shows dotfiles, and
     `F4` switches to a compact multi-column view (start in it with `--wide`)
   - From the viewer, `X`/Esc returns to the list, `[`/`]` step through the
@@ -91,11 +94,16 @@ some-command | lyst
   `H` hex, `X` exit, `h` help; vi-style `j`/`k`/`g`/`G`/`/`/`n`/`N` also work
 - Literal or regex search (`R`), smart case, match highlighting, wraps around
 - Zip, tar and tar.gz archives show their table of contents, like
-  `unzip -l` or `tar -tvf`, without extracting anything: a table of mode,
-  owner, size, compressed size (zip), date and name, so `<`/`>` sort it and
-  `&` filters it. Archives are recognized by their contents, not their
-  names, and take priority over a preprocessor. A large `.tar.gz` shows
-  progress while it's read, and Esc cancels
+  `unzip -l` or `tar -tvf`: a table of mode, owner, size, compressed size
+  (zip), date and name, so `<`/`>` sort it and `&` filters it. Up/Down select
+  a file and Enter (or a double-click) views it, with highlighting and table
+  view as usual; `X` returns to the listing, and an archive inside an archive
+  opens as a listing too. Only the chosen file is read: in place from a tar
+  (instant, any size), decompressed on its own from a zip, and from a
+  `.tar.gz` by decompressing up to it (about 1 GB of contents a second;
+  files over 1 GB from a zip or tar.gz aren't opened). Archives are
+  recognized by their contents, not their names, and take priority over a
+  preprocessor. Slow listings and opens show progress, and Esc cancels
 - Hex dump mode, chosen automatically for binary files
 - Encodings: UTF-8, **CP437** (real DOS box-drawing and smiley glyphs), Latin-1,
   and 7-bit (strips the high bit, for old WordStar files). Cycle with `E`

@@ -239,9 +239,12 @@ pub fn with_progress<T: Send + 'static>(
     let mut progress = Progress { frame: 0, shown: false };
     while !handle.is_finished() {
         let elapsed = start.elapsed();
-        if elapsed >= SHOW_AFTER {
-            progress.show(label, name, elapsed);
+        if elapsed < SHOW_AFTER {
+            // Too soon for a spinner: leave keys typed ahead for afterwards.
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
         }
+        progress.show(label, name, elapsed);
         if wait_for_cancel(Duration::from_millis(50)) {
             cancel.store(true, Ordering::Relaxed);
             let _ = handle.join();

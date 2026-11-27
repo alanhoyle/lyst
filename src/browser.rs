@@ -117,6 +117,8 @@ FILES
   W                         open in the default web browser
   U                         disk usage of the file or directory
   Y                         copy the full path to the clipboard
+  #                         a shell in this directory ($SHELL); exit it to
+                            come back
 
 DISPLAY
   F2                        sort by name, extension, size or date
@@ -165,6 +167,8 @@ pub struct Browser {
     /// Set when the user asks to edit the selected file; the caller runs
     /// the editor.
     pub want_edit: Option<PathBuf>,
+    /// Set when the user asks for a shell here; the caller runs it.
+    pub want_shell: Option<PathBuf>,
     /// A binary file the user was warned about; editing it again goes ahead.
     edit_warned: Option<PathBuf>,
     /// The "go to directory" prompt, while open.
@@ -203,6 +207,7 @@ impl Browser {
             usage: None,
             goto: None,
             want_edit: None,
+            want_shell: None,
             edit_warned: None,
             history: Vec::new(),
             tags: Vec::new(),
@@ -637,6 +642,7 @@ impl Browser {
                     self.chdir(home, None);
                 }
             }
+            KeyCode::Char('#') => self.want_shell = Some(self.dir.clone()),
             KeyCode::Char('O') => self.open_external(),
             KeyCode::Char('/') if !ctrl => self.jump = Some(String::new()),
             KeyCode::Char('q' | 'Q') if !ctrl => return Action::Quit,
@@ -691,6 +697,19 @@ impl Browser {
             Err(e) => self.error(format!("Can't run editor \"{editor}\": {e} (set $VISUAL or $EDITOR)")),
             Ok(s) if !s.success() => self.error(format!("Editor \"{editor}\" exited with {s}")),
             Ok(_) => {}
+        }
+    }
+
+    /// After the shell exits: rereads the directory (it may have changed),
+    /// keeping the selection.
+    pub fn shell_done(&mut self, result: io::Result<std::process::ExitStatus>) {
+        let selected = self.entries.get(self.sel).map(|e| e.path.clone());
+        self.refresh();
+        if let Some(p) = selected {
+            self.select_path(&p);
+        }
+        if let Err(e) = result {
+            self.error(format!("Can't run shell \"{}\": {e} (set $SHELL)", crate::external::shell_program()));
         }
     }
 
@@ -1590,6 +1609,15 @@ mod tests {
         #[cfg(not(unix))]
         assert!(s.contains(" 600 bytes  ") && !s.contains("(640)"), "{s}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hash_asks_for_a_shell_here() {
+        let mut b = Browser::new(Path::new("samples"), false, Prefs::new(false)).unwrap();
+        press(&mut b, "#");
+        assert_eq!(b.want_shell.take(), Some(b.dir.clone()));
+        b.shell_done(Ok(std::process::ExitStatus::default()));
+        assert!(b.message.is_none());
     }
 
     #[test]

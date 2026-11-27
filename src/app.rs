@@ -54,6 +54,11 @@ DISPLAY
                             chr2 before chr10; again for file order
   P                         (table view) pin the first column (on by default)
 
+ARCHIVES (zip, tar, tar.gz: their contents are listed)
+  Up / Down, PgUp / PgDn    select a file in the listing
+  Enter or double-click     view it (an archive inside opens as a listing)
+  X or Esc                  back to the listing
+
 MARKS AND FILES
   m <letter>                set a mark at the top line
   ' <letter>                jump to a mark
@@ -180,26 +185,32 @@ impl Source {
                 let (v, filter) = crate::preprocess::stdin(v)?;
                 Ok(Document::from_bytes("<stdin>", v).filtered(filter))
             }
-            Source::Path(p) => match crate::archive::detect(p) {
-                Some(kind) => {
-                    let path = p.clone();
-                    let listed = crate::preprocess::with_progress("Listing", &p.to_string_lossy(), move |cancel| {
-                        crate::archive::listing(&path, kind, cancel)
-                    })?;
-                    match listed {
-                        Ok(bytes) => {
-                            let mut d = Document::from_bytes(p.display().to_string(), bytes);
-                            d.archive = Some(kind.label());
-                            Ok(d)
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
-                        // Not readable as an archive after all: show the file.
-                        Err(_) => load_file(p),
-                    }
+            Source::Path(p) => {
+                if let Ok(origin) = crate::archive::Origin::file(p)
+                    && let Some(d) = archive_listing(&p.display().to_string(), &origin)?
+                {
+                    return Ok(d);
                 }
-                None => load_file(p),
-            },
+                load_file(p)
+            }
         }
+    }
+}
+
+/// The table of contents of the archive at `origin`, or None if it isn't
+/// one (or turns out not to be readable as one). Fails only if canceled.
+fn archive_listing(name: &str, origin: &crate::archive::Origin) -> io::Result<Option<Document>> {
+    let Some(kind) = crate::archive::detect(origin) else { return Ok(None) };
+    let o = origin.clone();
+    let listed = crate::preprocess::with_progress("Listing", name, move |cancel| crate::archive::listing(&o, kind, cancel))?;
+    match listed {
+        Ok((bytes, index)) => {
+            let mut d = Document::from_bytes(name, bytes);
+            d.archive = Some(std::sync::Arc::new(index));
+            Ok(Some(d))
+        }
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
+        Err(_) => Ok(None),
     }
 }
 
@@ -249,6 +260,8 @@ struct View {
     /// Set while lines are filtered or sorted: the document shown is built
     /// from this original.
     derived: Option<Box<Derived>>,
+    /// The selected line of an archive listing, which Enter opens.
+    row: Option<usize>,
 }
 
 /// The original document behind a filtered or sorted one.
@@ -266,8 +279,8 @@ impl View {
         let ansi = opts.ansi && doc.has_ansi();
         // A preprocessor may have laid the table out already (lesspipe runs
         // csvlook on .csv.gz); only add our own if the separator survived.
-        let named = match doc.archive {
-            Some(kind) => Some(Format::listing(kind)),
+        let named = match &doc.archive {
+            Some(a) => Some(Format::listing(a.kind.label())),
             None => Format::for_name(&doc.name)
                 .filter(|f| doc.filter.is_none() || Format::sniff(doc).is_some_and(|s| s.same_separator(f))),
         };
@@ -277,8 +290,15 @@ impl View {
             })),
             _ => None,
         };
-        View { hex, hl: DocHighlighter::detect(doc, &opts.highlight), ansi, table, ..View::default() }
+        let row = if doc.archive.is_some() { first_row(doc, table.as_ref()) } else { None };
+        View { hex, hl: DocHighlighter::detect(doc, &opts.highlight), ansi, table, row, ..View::default() }
     }
+}
+
+/// The first entry line of an archive listing shown as `table`, if any.
+fn first_row(doc: &Document, table: Option<&Table>) -> Option<usize> {
+    let first = table?.header.map_or(0, |h| h + 1);
+    (first < doc.line_count()).then_some(first)
 }
 
 struct Slot {
@@ -338,6 +358,11 @@ pub struct App {
     pub full_redraw: bool,
     /// Text to put on the clipboard with the next frame (OSC 52).
     clipboard: Option<String>,
+    /// While viewing a file inside an archive: the listings it was opened
+    /// from, innermost last. X goes back to them.
+    stack: Vec<(Document, View)>,
+    /// When and where the left button last went down, for double-clicks.
+    last_click: Option<(std::time::Instant, usize)>,
 }
 
 impl App {
@@ -368,6 +393,8 @@ impl App {
             from_browser: false,
             full_redraw: false,
             clipboard: None,
+            stack: Vec::new(),
+            last_click: None,
         };
         app.view = app.fresh_view();
         if app.view.hex && !app.opts.hex {
@@ -389,10 +416,18 @@ impl App {
 
     /// Path of the file being viewed, if it is a real file.
     pub fn current_path(&self) -> Option<&std::path::Path> {
+        if !self.stack.is_empty() {
+            return None;
+        }
         match &self.slots[self.cur].source {
             Source::Path(p) => Some(p),
             Source::Stdin => None,
         }
+    }
+
+    /// What's being viewed when there's no file path for it.
+    fn pathless(&self) -> &'static str {
+        if self.stack.is_empty() { "Standard input" } else { "A file inside an archive" }
     }
 
     fn open_browser(&mut self) {
@@ -411,7 +446,7 @@ impl App {
     /// Opens the current file in the OS's default application.
     fn open_external(&mut self) {
         let Some(p) = self.current_path().map(std::path::Path::to_path_buf) else {
-            return self.error("Standard input has no file to open in another application");
+            return self.error(format!("{} has no file to open in another application", self.pathless()));
         };
         let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
         match crate::external::open(&p) {
@@ -423,7 +458,7 @@ impl App {
     /// Opens this file in the default web browser (or `$BROWSER`).
     fn open_web(&mut self) {
         let Some(p) = self.current_path().map(std::path::Path::to_path_buf) else {
-            return self.error("Standard input has no file to open in a web browser");
+            return self.error(format!("{} has no file to open in a web browser", self.pathless()));
         };
         let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
         match crate::external::open_in_browser(&p) {
@@ -436,7 +471,7 @@ impl App {
     /// needing a second press) if it doesn't look like text.
     fn request_edit(&mut self, warned: Option<PathBuf>) {
         let Some(p) = self.current_path().map(std::path::Path::to_path_buf) else {
-            return self.error("Standard input has no file to edit");
+            return self.error(format!("{} has no file to edit", self.pathless()));
         };
         let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
         match crate::external::looks_binary(&p) {
@@ -615,6 +650,9 @@ impl App {
             carry(&mut nt);
             nt
         });
+        if base.archive.is_some() {
+            view.row = first_row(&doc, view.table.as_ref());
+        }
         // A new sort starts at the top; a filter stays near the same place.
         view.top_line = if matches!(ops.last(), Some(Op::Sort { .. })) {
             0
@@ -684,7 +722,7 @@ impl App {
     /// over SSH too.
     fn copy(&mut self, path: bool) {
         if path {
-            let Some(p) = self.current_path() else { return self.error("Standard input has no path to copy") };
+            let Some(p) = self.current_path() else { return self.error(format!("{} has no path to copy", self.pathless())) };
             let p = crate::paths::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string();
             self.flash(format!("Copied {p}"));
             self.clipboard = Some(p);
@@ -730,6 +768,8 @@ impl App {
                     row("Owner", crate::owners::owner_group(m.uid(), m.gid()));
                 }
             }
+        } else if let Some((outer, _)) = self.stack.last() {
+            row("Inside", outer.name.clone());
         } else {
             row("Source", "standard input".into());
         }
@@ -751,8 +791,8 @@ impl App {
             },
         );
         row("Encoding", format!("{} (E cycles)", self.opts.encoding.label()));
-        let kind = if let Some(a) = doc.archive {
-            format!("{a} archive (its contents listed, not extracted)")
+        let kind = if let Some(a) = &doc.archive {
+            format!("{} archive (its contents listed; Enter opens one)", a.kind.label())
         } else if doc.looks_binary() {
             "binary".to_string()
         } else if let Some(t) = &view.table {
@@ -1016,12 +1056,137 @@ impl App {
         self.message = Some((s.into(), true));
     }
 
+    // --------------------------------------------------------------- archives
+
+    /// The archive behind the listing shown, also while it's filtered or sorted.
+    fn archive_index(&self) -> Option<std::sync::Arc<crate::archive::Index>> {
+        match &self.view.derived {
+            Some(d) => d.base.archive.clone(),
+            None => self.doc.archive.clone(),
+        }
+    }
+
+    /// First and last entry lines of the listing shown, when its row cursor is on.
+    fn listing_rows(&self) -> Option<(usize, usize)> {
+        if self.view.hex || self.view.row.is_none() {
+            return None;
+        }
+        let first = self.view.table.as_ref()?.header.map_or(0, |h| h + 1);
+        let last = self.doc.line_count().checked_sub(1)?;
+        (first <= last).then_some((first, last))
+    }
+
+    /// Moves the row cursor of an archive listing, or opens its entry.
+    /// Returns false for keys it leaves to the usual handling.
+    fn listing_key(&mut self, code: KeyCode, page: usize) -> bool {
+        let Some((first, last)) = self.listing_rows() else { return false };
+        let row = self.view.row.unwrap_or(first);
+        let to = match code {
+            KeyCode::Up | KeyCode::Char('k') => row.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => row + 1,
+            KeyCode::PageUp | KeyCode::Char('b') => row.saturating_sub(page),
+            KeyCode::PageDown | KeyCode::Char(' ') => row + page,
+            KeyCode::Home | KeyCode::Char('g') => first,
+            KeyCode::End | KeyCode::Char('G') => last,
+            KeyCode::Enter => {
+                self.open_entry();
+                return true;
+            }
+            _ => return false,
+        };
+        self.view.row = Some(to.clamp(first, last));
+        self.show_row();
+        true
+    }
+
+    /// Scrolls so the row cursor is on screen.
+    fn show_row(&mut self) {
+        let Some(r) = self.view.row else { return };
+        let rows = self.text_rows().max(1);
+        self.view.top_sub = 0;
+        if r < rows {
+            // Near the start: show it from the top, summary included.
+            self.view.top_line = 0;
+            return;
+        }
+        if r < self.view.top_line {
+            self.view.top_line = r;
+        }
+        // A header pinned at the top takes a line from the rows below it.
+        let pinned = usize::from(self.sticky_header().is_some());
+        if r >= self.view.top_line + rows - pinned {
+            let header = usize::from(self.view.table.as_ref().is_some_and(|t| t.header.is_some()));
+            self.view.top_line = r + 1 - (rows - header).max(1);
+        }
+    }
+
+    /// Enter in a listing: shows the selected file (or, for an archive
+    /// inside the archive, its listing). X returns here.
+    fn open_entry(&mut self) {
+        use crate::archive::{Contents, Origin};
+        let (Some(index), Some(row)) = (self.archive_index(), self.view.row) else { return };
+        let Some(entry) = index.entry_at(self.orig_line(row)) else { return };
+        let entry = match index.resolve(entry) {
+            Ok(e) => e.clone(),
+            Err(m) => return self.error(m),
+        };
+        let listing_name = match &self.view.derived {
+            Some(d) => d.base.name.clone(),
+            None => self.doc.name.clone(),
+        };
+        let name = format!("{listing_name}/{}", entry.name.trim_start_matches('/'));
+        let (origin, kind, e) = (index.origin.clone(), index.kind, entry.clone());
+        let opened = crate::preprocess::with_progress("Opening", &entry.name, move |c| crate::archive::open(&origin, kind, &e, c));
+        let doc = opened.and_then(|r| r).and_then(|contents| match contents {
+            Contents::Bytes(b) if crate::archive::detect(&Origin::Bytes(b[..b.len().min(1024)].into())).is_some() => {
+                let origin = Origin::Bytes(b.into());
+                Ok(archive_listing(&name, &origin)?.unwrap_or_else(|| {
+                    let Origin::Bytes(b) = origin else { unreachable!() };
+                    Document::from_bytes(name.clone(), b.to_vec())
+                }))
+            }
+            Contents::Bytes(b) => Ok(Document::from_bytes(name.clone(), b)),
+            Contents::Range { path, start, len } => {
+                let origin = Origin::File { path: path.clone(), start, len };
+                match archive_listing(&name, &origin)? {
+                    Some(d) => Ok(d),
+                    None => Document::open_range(name.clone(), &path, start, len),
+                }
+            }
+        });
+        let doc = match doc {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return self.flash("Canceled"),
+            Err(e) => return self.error(format!("{}: {e}", entry.name)),
+        };
+        let view = View::new(&doc, &self.opts);
+        let outer = (std::mem::replace(&mut self.doc, doc), std::mem::replace(&mut self.view, view));
+        self.stack.push(outer);
+        self.invalidate_layout();
+        if self.view.hex && !self.opts.hex {
+            self.flash("Binary file: showing hex (H to toggle) · X returns to the archive");
+        } else {
+            self.flash(format!("{} · X returns to the archive", entry.name));
+        }
+    }
+
+    /// X or Esc inside an archive: back to the listing, as it was left.
+    /// False when not inside one.
+    fn leave_member(&mut self) -> bool {
+        let Some((doc, view)) = self.stack.pop() else { return false };
+        self.doc = doc;
+        self.view = view;
+        self.invalidate_layout();
+        true
+    }
+
     // ------------------------------------------------------------------ files
 
     fn switch_file(&mut self, idx: usize) {
         if idx == self.cur || idx >= self.slots.len() {
             return;
         }
+        while self.leave_member() {}
         let (doc, view) = match self.slots[idx].parked.take() {
             Some(p) => p,
             None => match self.slots[idx].source.load() {
@@ -1132,6 +1297,11 @@ impl App {
         if line < self.view.top_line || line > self.view.bottom_line || (line == self.view.top_line && self.view.top_sub > 0) {
             self.jump_to_offset(off, ctx);
         }
+        if let Some((first, last)) = self.listing_rows()
+            && (first..=last).contains(&line)
+        {
+            self.view.row = Some(line);
+        }
         if let Some(t) = &self.view.table {
             let (start, bytes) = self.doc.line(line);
             if t.kind(line, bytes) != RowKind::Meta {
@@ -1213,6 +1383,12 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         let page = self.text_rows().saturating_sub(1).max(1);
+        if !ctrl && self.listing_key(k.code, page) {
+            return;
+        }
+        if matches!(k.code, KeyCode::Esc | KeyCode::Char('x' | 'X')) && self.leave_member() {
+            return;
+        }
         if ctrl {
             match k.code {
                 KeyCode::Char('c') => {
@@ -1374,10 +1550,32 @@ impl App {
             MouseEventKind::ScrollLeft => self.hscroll_by(-8),
             MouseEventKind::ScrollDown => self.scroll_down(3),
             MouseEventKind::ScrollUp => self.scroll_up(3),
-            MouseEventKind::Down(MouseButton::Left) => self.message = None,
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.message = None;
+                self.click_row(m.row as usize);
+            }
             _ => return false,
         }
         true
+    }
+
+    /// A click on a listing's row selects it; a second click soon after opens it.
+    fn click_row(&mut self, y: usize) {
+        let Some((first, last)) = self.listing_rows() else { return };
+        // Row 0 is the status bar; a pinned header takes the first text row.
+        let Some(y) = y.checked_sub(1 + usize::from(self.sticky_header().is_some())) else { return };
+        let line = self.view.top_line + y;
+        if !(first..=last).contains(&line) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let double = self.last_click.is_some_and(|(t, l)| l == line && now.duration_since(t).as_millis() < 400);
+        self.view.row = Some(line);
+        self.last_click = Some((now, line));
+        if double {
+            self.last_click = None;
+            self.open_entry();
+        }
     }
 
     fn hscroll_by(&mut self, delta: isize) {
@@ -1406,8 +1604,8 @@ impl App {
         if self.doc.filter.is_some() {
             return self.error("Can't follow preprocessed input");
         }
-        if self.doc.archive.is_some() {
-            return self.error("Can't follow an archive listing");
+        if self.doc.archive.is_some() || !self.stack.is_empty() {
+            return self.error("Can't follow an archive or a file inside one");
         }
         if self.view.derived.is_some() {
             return self.error("Can't follow while filtered or sorted (& then Enter shows all lines)");
@@ -1658,6 +1856,16 @@ impl App {
                 }
             }
         }
+        // The wheel may have scrolled the row cursor away: bring it along.
+        if let Some(r) = self.view.row
+            && !self.view.hex
+        {
+            let lo = top.max(t.header.map_or(0, |h| h + 1));
+            let hi = (top + body).min(count).saturating_sub(1);
+            if lo <= hi {
+                self.view.row = Some(r.clamp(lo, hi));
+            }
+        }
         let mut y = 0;
         if let Some(h) = sticky.filter(|_| rows > 1) {
             self.draw_table_row(out, &t, h, y)?;
@@ -1697,7 +1905,12 @@ impl App {
         if gw > 0 {
             p.text(self.theme.gutter, &format!("{:>w$} ", self.orig_line(line) + 1, w = gw - 1));
         }
+        let selected = self.view.row == Some(line) && kind == RowKind::Data;
+        let fill = if selected { self.theme.select } else { self.theme.text };
         let style_of = |tc: &TCell| {
+            if selected {
+                return self.theme.select;
+            }
             let c = &tc.cell;
             let base = match (kind, tc.col) {
                 (RowKind::Meta, _) => self.theme.hint,
@@ -1731,7 +1944,7 @@ impl App {
                 }
                 col += w;
             }
-            p.text(self.theme.text, &" ".repeat(starts[1].saturating_sub(col)));
+            p.text(fill, &" ".repeat(starts[1].saturating_sub(col)));
         }
         let mut col = 0;
         for tc in &cells {
@@ -1749,7 +1962,7 @@ impl App {
                 break;
             }
         }
-        p.finish(out, y + 1, self.theme.text)
+        p.finish(out, y + 1, fill)
     }
 
     fn draw_hex(&mut self, out: &mut impl Write) -> io::Result<()> {
@@ -1920,13 +2133,25 @@ impl App {
             None if matches!(self.mode, Mode::Help { .. } | Mode::Info { .. }) => {
                 p.text(self.theme.hint, " Up/Down/PgUp/PgDn scroll · any other key returns")
             }
+            None if self.view.row.is_some() && !self.view.hex => p.text(
+                self.theme.hint,
+                if self.stack.is_empty() {
+                    " h Help  Enter Open  F Find  & Filter  < > Sort  X Exit"
+                } else {
+                    " h Help  Enter Open  F Find  & Filter  < > Sort  X Back"
+                },
+            ),
             None if self.view.table.is_some() && !self.view.hex => p.text(
                 self.theme.hint,
-                " h Help  & Filter  < > Sort  P Pin  S Colors  D Text  X Exit",
+                if self.stack.is_empty() {
+                    " h Help  & Filter  < > Sort  P Pin  S Colors  D Text  X Exit"
+                } else {
+                    " h Help  & Filter  < > Sort  P Pin  S Colors  D Text  X Back"
+                },
             ),
             None => p.text(
                 self.theme.hint,
-                if self.from_browser {
+                if self.from_browser || !self.stack.is_empty() {
                     " h Help  F Find  A Again  & Filter  L Line  w Wrap  H Hex  V Edit  X Back  Q Quit"
                 } else {
                     " h Help  F Find  A Again  & Filter  L Line  w Wrap  H Hex  V Edit  B Browse  X Exit"
@@ -2177,6 +2402,96 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn code(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    fn archive_app(path: &std::path::Path) -> App {
+        let src = Source::Path(path.to_path_buf());
+        let doc = src.load().unwrap();
+        let mut a = App::new(vec![src], 0, doc, opts());
+        a.resize(100, 20);
+        a
+    }
+
+    #[test]
+    fn enter_opens_a_file_inside_an_archive_and_x_returns() {
+        for path in ["samples/project.zip", "samples/project.tar", "samples/project.tar.gz"] {
+            let mut a = archive_app(std::path::Path::new(path));
+            assert!(a.doc.archive.is_some(), "{path}");
+            // Below the summary and the header: three directories, then README.md.
+            assert_eq!(a.view.row, Some(2), "{path}");
+            for _ in 0..3 {
+                a.on_key(code(KeyCode::Down));
+            }
+            assert_eq!(a.view.row, Some(5));
+            assert!(screen(&mut a).iter().any(|r| r.contains("project/README.md")));
+            a.on_key(code(KeyCode::Enter));
+            assert_eq!(a.doc.name, format!("{path}/project/README.md"));
+            assert!(a.doc.bytes().starts_with(b"# Sample files"), "{path}");
+            assert!(a.current_path().is_none(), "no path to edit or open elsewhere");
+            a.on_key(key('o'));
+            assert!(matches!(&a.message, Some((m, true)) if m.starts_with("A file inside an archive")));
+            a.on_key(key('x'));
+            assert!(!a.quit && a.doc.archive.is_some() && a.view.row == Some(5), "{path}: back where it was");
+
+            // A directory doesn't open; a CSV opens as a table.
+            a.on_key(code(KeyCode::Up));
+            a.on_key(code(KeyCode::Enter));
+            assert!(matches!(&a.message, Some((m, true)) if m.ends_with("is a directory")), "{:?}", a.message);
+            a.on_key(code(KeyCode::Down));
+            a.on_key(code(KeyCode::Down));
+            a.on_key(code(KeyCode::Enter));
+            assert!(a.doc.name.ends_with("project/data/people.csv") && a.view.table.is_some(), "{}", a.doc.name);
+            a.on_key(code(KeyCode::Esc));
+            assert!(a.doc.archive.is_some());
+            a.on_key(key('x'));
+            assert!(a.quit, "X in the listing itself exits as usual");
+        }
+    }
+
+    #[test]
+    fn links_filters_and_archives_inside_archives() {
+        // The tar's last entry is a symlink: it opens what it points to.
+        let mut a = archive_app(std::path::Path::new("samples/project.tar"));
+        a.on_key(code(KeyCode::End));
+        a.on_key(code(KeyCode::Enter));
+        assert_eq!(a.doc.bytes(), &std::fs::read("samples/variants.vcf").unwrap()[..]);
+        a.on_key(key('x'));
+
+        // Filtered to one row, Enter opens that entry of the original.
+        a.on_key(key('&'));
+        for c in "scores".chars() {
+            a.on_key(key(c));
+        }
+        a.on_key(code(KeyCode::Enter));
+        a.on_key(code(KeyCode::Enter));
+        assert!(a.doc.name.ends_with("project/data/scores.tsv"), "{}", a.doc.name);
+        assert_eq!(a.doc.bytes(), &std::fs::read("samples/scores.tsv").unwrap()[..]);
+
+        // A tar.gz stored in a zip: a listing within a listing.
+        let dir = std::env::temp_dir().join(format!("lyst-nested-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outer = dir.join("outer.zip");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&outer).unwrap());
+        z.start_file("inner.tar.gz", zip::write::SimpleFileOptions::default()).unwrap();
+        io::Write::write_all(&mut z, &std::fs::read("samples/project.tar.gz").unwrap()).unwrap();
+        z.finish().unwrap();
+        let mut a = archive_app(&outer);
+        a.on_key(code(KeyCode::Enter));
+        assert!(a.doc.archive.is_some(), "the inner archive is listed");
+        assert_eq!(a.doc.name, format!("{}/inner.tar.gz", outer.display()));
+        for _ in 0..3 {
+            a.on_key(code(KeyCode::Down));
+        }
+        a.on_key(code(KeyCode::Enter));
+        assert!(a.doc.name.ends_with("outer.zip/inner.tar.gz/project/README.md"), "{}", a.doc.name);
+        a.on_key(key('x'));
+        a.on_key(key('x'));
+        assert!(a.doc.name.ends_with("outer.zip") && !a.quit);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

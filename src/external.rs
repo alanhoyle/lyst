@@ -268,6 +268,25 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+/// The user's shell: `$SHELL`, else `/bin/sh` (`%COMSPEC%`, else `cmd`, on
+/// Windows).
+pub fn shell_program() -> String {
+    shell_from(|k| std::env::var(k).ok())
+}
+
+fn shell_from(var: impl Fn(&str) -> Option<String>) -> String {
+    let (key, fallback) = if cfg!(windows) { ("COMSPEC", "cmd") } else { ("SHELL", "/bin/sh") };
+    var(key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| fallback.into())
+}
+
+/// Runs an interactive shell in `dir` until the user exits it. `LYST_SHELL`
+/// is set in it, so a prompt can show that lyst is waiting underneath.
+pub fn subshell(dir: &Path) -> io::Result<ExitStatus> {
+    let shell = shell_program();
+    println!("lyst: {shell} in {} · type exit to return to lyst", dir.display());
+    Command::new(&shell).current_dir(dir).env("LYST_SHELL", "1").status()
+}
+
 /// The user's editor: `$VISUAL`, then `$EDITOR`, then `vi` (Notepad on
 /// Windows, which has no convention of its own). It may include arguments,
 /// like `code --wait`.
@@ -329,6 +348,16 @@ fn binary_bytes(b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_setting() {
+        let none = |_: &str| None;
+        let fallback = if cfg!(windows) { "cmd" } else { "/bin/sh" };
+        assert_eq!(shell_from(none), fallback);
+        let key = if cfg!(windows) { "COMSPEC" } else { "SHELL" };
+        assert_eq!(shell_from(|k: &str| (k == key).then(|| " /bin/zsh ".into())), "/bin/zsh");
+        assert_eq!(shell_from(|k: &str| (k == key).then(|| "  ".into())), fallback, "blank counts as unset");
+    }
 
     #[test]
     fn clipboard_sequence() {

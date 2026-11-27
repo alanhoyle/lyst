@@ -7,12 +7,15 @@ use std::path::{Path, PathBuf};
 
 enum Data {
     Mapped(Mmap),
+    /// Part of a mapped file: a file stored in a tar.
+    MappedRange(Mmap, std::ops::Range<usize>),
     Owned(Vec<u8>),
 }
 
 fn slice(d: &Data) -> &[u8] {
     match d {
         Data::Mapped(m) => &m[..],
+        Data::MappedRange(m, r) => &m[r.clone()],
         Data::Owned(v) => v,
     }
 }
@@ -22,8 +25,8 @@ pub struct Document {
     pub name: String,
     /// Name of the input preprocessor that produced this content, if any.
     pub filter: Option<String>,
-    /// Set when this is an archive's table of contents ("zip", "tar.gz").
-    pub archive: Option<&'static str>,
+    /// Set when this is an archive's table of contents.
+    pub archive: Option<std::sync::Arc<crate::archive::Index>>,
     path: Option<PathBuf>,
     data: Data,
     /// Byte offset of the start of every line. Always contains at least `0`.
@@ -56,6 +59,30 @@ impl Document {
         };
         d.index_from(0);
         d
+    }
+
+    /// Bytes `start..start + len` of the file at `path`, as a document of
+    /// their own (a file inside a tar). It isn't reloaded or followed.
+    pub fn open_range(name: impl Into<String>, path: &Path, start: u64, len: u64) -> io::Result<Self> {
+        let mut f = File::open(path)?;
+        let file_len = f.metadata()?.len();
+        let end = start.checked_add(len).filter(|&e| e <= file_len);
+        let end = end.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "the archive is cut short"))?;
+        let data = if len < MAP_THRESHOLD.max(1 << 20) {
+            // Small files are simply read.
+            use std::io::Seek;
+            f.seek(io::SeekFrom::Start(start))?;
+            let mut v = Vec::with_capacity(len as usize);
+            f.take(len).read_to_end(&mut v)?;
+            Data::Owned(v)
+        } else {
+            // SAFETY: as in `load`.
+            let m = unsafe { Mmap::map(&f)? };
+            Data::MappedRange(m, start as usize..end as usize)
+        };
+        let mut d = Document { name: name.into(), filter: None, archive: None, path: None, data, line_starts: vec![0] };
+        d.index_from(0);
+        Ok(d)
     }
 
     pub fn bytes(&self) -> &[u8] {

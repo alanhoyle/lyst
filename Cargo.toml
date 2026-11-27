@@ -18,7 +18,7 @@ syntect = { version = "5.3.0", default-features = false, features = ["parsing", 
 tar = { version = "0.4.46", default-features = false }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 unicode-width = "0.2.3"
-zip = { version = "=9.5.1", default-features = false }
+zip = { version = "=9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # Only used to signal a preprocessor's process group on Unix.
 [target.'cfg(unix)'.dependencies]

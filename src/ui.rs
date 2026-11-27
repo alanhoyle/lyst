@@ -111,6 +111,21 @@ impl Ui {
         }
     }
 
+    /// A directory the browser wants a shell in, if any.
+    pub fn take_shell(&mut self) -> Option<std::path::PathBuf> {
+        match (&self.viewer, &mut self.browser) {
+            (None, Some(b)) => b.want_shell.take(),
+            _ => None,
+        }
+    }
+
+    /// After the shell run for `take_shell` exits.
+    pub fn shell_done(&mut self, result: io::Result<std::process::ExitStatus>) {
+        if let (None, Some(b)) = (&self.viewer, &mut self.browser) {
+            b.shell_done(result);
+        }
+    }
+
     /// After the editor run for `take_edit` exits.
     pub fn edited(&mut self, path: &std::path::Path, result: io::Result<std::process::ExitStatus>) {
         match (&mut self.viewer, &mut self.browser) {

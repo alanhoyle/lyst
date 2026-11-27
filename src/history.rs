@@ -69,7 +69,7 @@ fn record_in(file: Option<&Path>, current: &[PathBuf], dir: &Path) -> Vec<PathBu
 /// How a directory is shown and typed: `~/...` under the home directory,
 /// with a trailing `/`.
 pub fn display(dir: &Path) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::paths::home();
     let s = match home.as_deref().and_then(|h| dir.strip_prefix(h).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Some(rest) => format!("~/{}", rest.display()),
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn display_uses_tilde() {
-        if let Some(h) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(h) = crate::paths::home() {
             assert_eq!(display(&h.join("src/lyst")), "~/src/lyst/");
             assert_eq!(display(&h), "~/");
         }

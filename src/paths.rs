@@ -11,6 +11,13 @@ pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     std::fs::canonicalize(path).map(plain)
 }
 
+/// The home directory: `$HOME`, or on Windows (where it's usually unset)
+/// `%USERPROFILE%`.
+pub fn home() -> Option<PathBuf> {
+    let var = |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    var("HOME").or_else(|| if cfg!(windows) { var("USERPROFILE") } else { None })
+}
+
 /// Removes a `\\?\` prefix when the path means the same without it. Paths
 /// long enough to need it keep it.
 fn plain(p: PathBuf) -> PathBuf {

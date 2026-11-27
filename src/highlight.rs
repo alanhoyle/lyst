@@ -25,7 +25,7 @@ pub fn config_dir() -> Option<PathBuf> {
     let var = |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     var("LYST_CONFIG_DIR")
         .or_else(|| var("XDG_CONFIG_HOME").map(|d| d.join("lyst")))
-        .or_else(|| var("HOME").map(|h| h.join(".config").join("lyst")))
+        .or_else(|| crate::paths::home().map(|h| h.join(".config").join("lyst")))
 }
 
 /// Themes loaded from `.tmTheme` files in the config directory.

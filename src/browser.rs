@@ -623,8 +623,8 @@ impl Browser {
             }
             KeyCode::F(5) => self.refresh(),
             KeyCode::Char('~') => {
-                if let Some(home) = std::env::var_os("HOME") {
-                    self.chdir(home.into(), None);
+                if let Some(home) = crate::paths::home() {
+                    self.chdir(home, None);
                 }
             }
             KeyCode::Char('O') => self.open_external(),

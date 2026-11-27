@@ -126,13 +126,9 @@ fn is_sep(c: char) -> bool {
     c == '/' || (cfg!(windows) && c == '\\')
 }
 
-fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
 fn expand(input: &str, base: &Path) -> PathBuf {
-    let rest = if input == "~" { Some("") } else { input.strip_prefix("~/") };
-    if let (Some(rest), Some(h)) = (rest, home()) {
+    let rest = if input == "~" { Some("") } else { input.strip_prefix('~').and_then(|r| r.strip_prefix(is_sep)) };
+    if let (Some(rest), Some(h)) = (rest, crate::paths::home()) {
         return h.join(rest);
     }
     base.join(input)
@@ -287,7 +283,7 @@ mod tests {
         assert_eq!(expand("src", base), Path::new("/base/src"));
         assert_eq!(expand("/etc", base), Path::new("/etc"));
         assert_eq!(expand("..", base), Path::new("/base/.."));
-        if let Some(h) = home() {
+        if let Some(h) = crate::paths::home() {
             assert_eq!(expand("~", base), h);
             assert_eq!(expand("~/x", base), h.join("x"));
         }

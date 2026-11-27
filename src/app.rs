@@ -2452,13 +2452,19 @@ mod tests {
         }
     }
 
+    /// A sample file as stored in the sample archives: with LF line endings,
+    /// though a Windows checkout may have given the file itself CRLF.
+    fn sample(name: &str) -> Vec<u8> {
+        std::fs::read(format!("samples/{name}")).unwrap().into_iter().filter(|&b| b != b'\r').collect()
+    }
+
     #[test]
     fn links_filters_and_archives_inside_archives() {
         // The tar's last entry is a symlink: it opens what it points to.
         let mut a = archive_app(std::path::Path::new("samples/project.tar"));
         a.on_key(code(KeyCode::End));
         a.on_key(code(KeyCode::Enter));
-        assert_eq!(a.doc.bytes(), &std::fs::read("samples/variants.vcf").unwrap()[..]);
+        assert_eq!(a.doc.bytes(), &sample("variants.vcf")[..]);
         a.on_key(key('x'));
 
         // Filtered to one row, Enter opens that entry of the original.
@@ -2469,7 +2475,7 @@ mod tests {
         a.on_key(code(KeyCode::Enter));
         a.on_key(code(KeyCode::Enter));
         assert!(a.doc.name.ends_with("project/data/scores.tsv"), "{}", a.doc.name);
-        assert_eq!(a.doc.bytes(), &std::fs::read("samples/scores.tsv").unwrap()[..]);
+        assert_eq!(a.doc.bytes(), &sample("scores.tsv")[..]);
 
         // A tar.gz stored in a zip: a listing within a listing.
         let dir = std::env::temp_dir().join(format!("lyst-nested-{}", std::process::id()));

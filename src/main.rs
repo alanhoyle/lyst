@@ -7,6 +7,8 @@ mod findfiles;
 mod goto;
 mod highlight;
 mod history;
+#[cfg(unix)]
+mod owners;
 mod paths;
 mod preprocess;
 mod rows;

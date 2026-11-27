@@ -9,6 +9,7 @@ license = "MIT"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.10", features = ["derive"] }
 crossterm = { version = "0.29.0", features = ["use-dev-tty"] }
+infer = { version = "0.22.0", default-features = false }
 memchr = "2.8.3"
 memmap2 = "0.9.12"
 regex = "1.13.2"

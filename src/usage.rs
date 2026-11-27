@@ -138,12 +138,30 @@ fn walk(root: &Path, p: &Progress) {
     }
 }
 
-/// Unix permission bits as `ls -l` shows them, e.g. `rw-r--r--`.
+/// Unix permission bits with the octal value, e.g. `rw-r--r-- (644)`.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn mode_string(mode: u32) -> String {
-    let bits = [(0o400, 'r'), (0o200, 'w'), (0o100, 'x'), (0o40, 'r'), (0o20, 'w'), (0o10, 'x'), (0o4, 'r'), (0o2, 'w'), (0o1, 'x')];
-    let s: String = bits.iter().map(|&(b, c)| if mode & b != 0 { c } else { '-' }).collect();
-    format!("{s} ({:o})", mode & 0o7777)
+    format!("{} ({:o})", perms(mode), mode & 0o7777)
+}
+
+/// Unix permission bits as `ls -l` shows them, e.g. `rwxr-sr-t`: `s`/`S`
+/// for setuid and setgid, `t`/`T` for sticky (upper case when the
+/// execute bit under it is off).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn perms(mode: u32) -> String {
+    let mut s = String::with_capacity(9);
+    for (shift, special, mark) in [(6, 0o4000, 's'), (3, 0o2000, 's'), (0, 0o1000, 't')] {
+        let rwx = (mode >> shift) & 7;
+        s.push(if rwx & 4 != 0 { 'r' } else { '-' });
+        s.push(if rwx & 2 != 0 { 'w' } else { '-' });
+        s.push(match (rwx & 1 != 0, mode & special != 0) {
+            (true, true) => mark,
+            (false, true) => mark.to_ascii_uppercase(),
+            (true, false) => 'x',
+            (false, false) => '-',
+        });
+    }
+    s
 }
 
 #[cfg(test)]
@@ -167,6 +185,11 @@ mod tests {
     fn permission_strings() {
         assert_eq!(mode_string(0o100644), "rw-r--r-- (644)");
         assert_eq!(mode_string(0o755), "rwxr-xr-x (755)");
+        assert_eq!(perms(0o4755), "rwsr-xr-x");
+        assert_eq!(perms(0o2640), "rw-r-S---");
+        assert_eq!(perms(0o1777), "rwxrwxrwt");
+        assert_eq!(perms(0o1770), "rwxrwx--T");
+        assert_eq!(perms(0), "---------");
     }
 
     #[test]

@@ -20,7 +20,8 @@ some-command | lyst
 ## Features
 
 - File browser like LIST's opening screen: `..`, directories, then files with
-  size and date. `h` shows all its keys.
+  size, date and (on Unix) permissions, under a header that totals the
+  files' sizes. `h` shows all its keys.
   - Arrows/PgUp/PgDn/Home/End move, Enter views, ← or Backspace goes up,
     `~` goes home, `Q` or Esc quits
   - `/` then the start of a name jumps to it (`/` again for the next match)
@@ -81,7 +82,8 @@ some-command | lyst
   line), `Y` the file's path, using the terminal's clipboard (OSC 52), so
   it works over SSH too
 - `=` shows file information: path, size, modification time, permissions,
-  line count, line endings and type
+  owner, line count, line endings, type, and the MIME type recognized from
+  the file's contents (with [`infer`](https://crates.io/crates/infer))
 - ANSI color escapes rendered as colors when present (like `less -R`),
   e.g. `git log --color | lyst`; `C` toggles, `--no-ansi` disables
 - Opens huge files instantly (memory-mapped, line index built with `memchr`)

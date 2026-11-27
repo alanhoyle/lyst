@@ -699,6 +699,8 @@ impl App {
                 {
                     use std::os::unix::fs::PermissionsExt;
                     row("Permissions", crate::usage::mode_string(m.permissions().mode()));
+                    use std::os::unix::fs::MetadataExt;
+                    row("Owner", crate::owners::owner_group(m.uid(), m.gid()));
                 }
             }
         } else {
@@ -732,6 +734,13 @@ impl App {
             "text".to_string()
         };
         row("Type", kind);
+        // From the file's own first bytes, so a compressed file read through
+        // a preprocessor still shows as compressed.
+        let head = match &path {
+            Some(p) => file_head(p),
+            None => doc.bytes()[..doc.len().min(HEAD)].to_vec(),
+        };
+        row("MIME type", mime_type(&head));
         if view.ansi {
             row("Colors", "ANSI escapes (C toggles)".into());
         }
@@ -1983,6 +1992,29 @@ impl Painter {
     }
 }
 
+
+/// Bytes read to recognize a file format; enough for every signature
+/// `infer` knows.
+const HEAD: usize = 8192;
+
+fn file_head(path: &std::path::Path) -> Vec<u8> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(HEAD);
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.take(HEAD as u64).read_to_end(&mut head);
+    }
+    head
+}
+
+/// The MIME type recognized from a file's first bytes, with the usual
+/// extension.
+fn mime_type(head: &[u8]) -> String {
+    match infer::get(head) {
+        Some(t) => format!("{} (.{})", t.mime_type(), t.extension()),
+        None => "not recognized from its contents".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2416,4 +2448,14 @@ mod tests {
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("hello from lyst"));
     }
+
+    #[test]
+    fn mime_types_from_contents() {
+        assert_eq!(mime_type(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"), "image/png (.png)");
+        assert_eq!(mime_type(&[0x1f, 0x8b, 8, 4, 0, 0, 0, 0]), "application/gzip (.gz)");
+        assert_eq!(mime_type(b"%PDF-1.7\n"), "application/pdf (.pdf)");
+        assert_eq!(mime_type(b"name,age\nAnn,34\n"), "not recognized from its contents");
+        assert_eq!(mime_type(b""), "not recognized from its contents");
+    }
+
 }

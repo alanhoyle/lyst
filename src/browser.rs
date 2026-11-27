@@ -63,6 +63,10 @@ struct Entry {
     is_link: bool,
     size: u64,
     modified: Option<SystemTime>,
+    /// Unix permission bits; None elsewhere.
+    mode: Option<u32>,
+    /// Unix owner and group ids; None elsewhere.
+    owner: Option<(u32, u32)>,
 }
 
 impl Entry {
@@ -238,6 +242,8 @@ impl Browser {
                 is_link,
                 size: meta.len(),
                 modified: meta.modified().ok(),
+                mode: unix_mode(&meta),
+                owner: unix_owner(&meta),
             });
         }
         let sort = self.sort;
@@ -265,6 +271,8 @@ impl Browser {
                     is_link: false,
                     size: 0,
                     modified: None,
+                    mode: fs::metadata(parent).ok().and_then(|m| unix_mode(&m)),
+                    owner: fs::metadata(parent).ok().and_then(|m| unix_owner(&m)),
                 },
             );
         }
@@ -445,6 +453,8 @@ impl Browser {
                     is_dir: rel.ends_with('/'),
                     is_link: meta.as_ref().is_some_and(|m| m.file_type().is_symlink()),
                     size: meta.as_ref().map_or(0, |m| m.len()),
+                    mode: meta.as_ref().and_then(unix_mode),
+                    owner: meta.as_ref().and_then(unix_owner),
                     modified: meta.and_then(|m| m.modified().ok()),
                     name,
                     path,
@@ -753,8 +763,7 @@ impl Browser {
     /// The bottom-bar text for the disk usage count.
     fn usage_line(&self, u: &Usage) -> String {
         let t = u.totals();
-        let name = self.entries.get(self.sel).map(|e| e.label()).unwrap_or_default();
-        let mut s = format!(" {name}  {} on disk", human_size(t.disk));
+        let mut s = format!(" {} on disk", human_size(t.disk));
         if t.dirs > 0 || t.files != 1 || !t.done {
             let files = if t.files == 1 { "file" } else { "files" };
             s += &format!(" ({} in {} {files}", human_size(t.bytes), t.files);
@@ -871,6 +880,8 @@ impl Browser {
         // Status bar: directory on the left, counts and sort on the right.
         let dirs = self.entries.iter().filter(|e| e.is_dir && e.name != "..").count();
         let files = self.entries.iter().filter(|e| !e.is_dir).count();
+        let bytes: u64 = self.entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+        let total = if bytes < 100_000 { format!("{bytes} bytes") } else { human_size(bytes) };
         let tagged = if self.tags.is_empty() { String::new() } else { format!("{} tagged  ", self.tags.len()) };
         let right = match &self.find {
             Some(f) => {
@@ -879,7 +890,7 @@ impl Browser {
                 format!("{tagged}{} matches{more}{busy} ", f.total)
             }
             None => format!(
-                "{tagged}{dirs} dirs  {files} files  Sort: {}{} ",
+                "{tagged}{dirs} dirs  {files} files  {total}  Sort: {}{} ",
                 self.sort.label(),
                 if self.show_hidden { "  +hidden" } else { "" }
             ),
@@ -954,7 +965,9 @@ impl Browser {
 
     fn draw_list(&self, out: &mut impl Write) -> io::Result<()> {
         let rows = self.rows();
-        let meta_w = 26; // "  12.3M  2026-11-25 21:16"
+        // Permissions only on Unix, and only when names keep a fair width.
+        let perms = cfg!(unix) && self.width >= 64;
+        let meta_w = if perms { 37 } else { 26 }; // "  12.3M  2026-11-25 21:16  rwxr-xr-x"
         let name_w = self.width.saturating_sub(meta_w + 2).max(8);
         for y in 0..rows {
             let mut p = Painter::new(self.width);
@@ -974,6 +987,10 @@ impl Browser {
                 let date = e.modified.map(format_time).unwrap_or_default();
                 let meta_style = if i == self.sel { self.theme.select } else { self.theme.gutter };
                 p.text(meta_style, &format!(" {size:>7}  {date:<16}"));
+                if perms {
+                    let mode = e.mode.map(crate::usage::perms).unwrap_or_default();
+                    p.text(meta_style, &format!("  {mode:<9}"));
+                }
             }
             p.finish(out, y + 1, fill)?;
         }
@@ -1066,13 +1083,22 @@ impl Browser {
             }
             None if let Some(u) = &self.usage => p.text(self.theme.text, &self.usage_line(u)),
             None if self.wide => {
-                // Columns hide sizes and dates, so show them for the selection.
+                // Columns hide sizes, dates, permissions and owners, so show them
+                // for the selection.
+                let mut info = String::new();
                 if let Some(e) = self.entries.get(self.sel) {
                     let size = if e.is_dir { "<DIR>".to_string() } else { format!("{} bytes", e.size) };
                     let date = e.modified.map(format_time).unwrap_or_default();
-                    p.text(self.theme.text, &format!(" {}  {size}  {date}", e.label()));
+                    let mode = e.mode.map(|m| format!("  {}", crate::usage::mode_string(m))).unwrap_or_default();
+                    let owner = owner_text(e.owner);
+                    let owner = if owner.is_empty() { owner } else { format!("  {owner}") };
+                    info = format!(" {size}  {date}{mode}{owner}");
+                    p.text(self.theme.text, &info);
                 }
-                p.text(self.theme.hint, "   h Help  F4 Details  Q Quit");
+                // The details come first; the key hints shrink to fit after them.
+                let room = self.width.saturating_sub(info.width());
+                let hint = ["   h Help  F4 Details  Q Quit", "   h Help"].into_iter().find(|h| h.width() <= room);
+                p.text(self.theme.hint, hint.unwrap_or(""));
             }
             None => p.text(
                 self.theme.hint,
@@ -1081,6 +1107,38 @@ impl Browser {
         }
         p.finish(out, y, self.theme.text)
     }
+}
+
+#[cfg(unix)]
+fn unix_mode(meta: &fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(meta.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn unix_mode(_: &fs::Metadata) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn unix_owner(meta: &fs::Metadata) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.uid(), meta.gid()))
+}
+
+#[cfg(not(unix))]
+fn unix_owner(_: &fs::Metadata) -> Option<(u32, u32)> {
+    None
+}
+
+/// `owner:group` for the status line; empty where there's no such thing.
+fn owner_text(owner: Option<(u32, u32)>) -> String {
+    #[cfg(unix)]
+    if let Some((uid, gid)) = owner {
+        return crate::owners::owner_group(uid, gid);
+    }
+    let _ = owner;
+    String::new()
 }
 
 pub(crate) fn human_size(n: u64) -> String {
@@ -1484,6 +1542,56 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The screen as plain text, escape sequences removed.
+    fn screen(b: &mut Browser) -> String {
+        let mut out = Vec::new();
+        b.draw(&mut out).unwrap();
+        let raw = String::from_utf8_lossy(&out);
+        let re = regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]").unwrap();
+        re.replace_all(&raw, "").into_owned()
+    }
+
+    #[test]
+    fn header_totals_file_sizes_and_unix_shows_permissions() {
+        let dir = std::env::temp_dir().join(format!("lyst-browser-perms-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.txt"), vec![b'x'; 600]).unwrap();
+        fs::write(dir.join("b.txt"), vec![b'y'; 400]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.join("a.txt"), fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
+        b.resize(80, 8);
+        let s = screen(&mut b);
+        assert!(s.contains("1 dirs  2 files  1000 bytes"), "{s}");
+        #[cfg(unix)]
+        assert!(s.contains("rw-r-----"), "{s}");
+        #[cfg(not(unix))]
+        assert!(!s.contains("rw-"), "{s}");
+        // Narrow screens leave the column out to keep names readable.
+        b.resize(60, 8);
+        assert!(!screen(&mut b).contains("rw-r-----"));
+
+        // The wide view puts it on the bottom line for the selection.
+        b.resize(80, 8);
+        b.wide = true;
+        b.select_name("a.txt");
+        let s = screen(&mut b);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let m = fs::metadata(dir.join("a.txt")).unwrap();
+            let owner = crate::owners::owner_group(m.uid(), m.gid());
+            assert!(s.contains(&format!(" 600 bytes  {}", format_time(m.modified().unwrap()))) && s.contains(&format!("rw-r----- (640)  {owner}")), "{s}");
+        }
+        #[cfg(not(unix))]
+        assert!(s.contains(" 600 bytes  ") && !s.contains("(640)"), "{s}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn h_shows_help_and_y_copies_the_path() {
         let mut b = Browser::new(Path::new("samples"), false, Prefs::new(false)).unwrap();
@@ -1545,7 +1653,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let line = b.usage_line(b.usage.as_ref().unwrap());
-        assert!(line.contains("sub/") && line.contains("in 2 files, 1 subdirectory"), "{line}");
+        assert!(line.contains(" on disk (5000 in 2 files, 1 subdirectory)"), "{line}");
+        assert!(!line.contains("sub/"), "the selection is already highlighted: {line}");
         assert!(!line.contains('…'), "finished: {line}");
 
         // Moving to another entry drops the count from the bottom bar.

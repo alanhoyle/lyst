@@ -41,19 +41,18 @@ Sleep 800ms
 Enter
 Sleep 2.5s
 
-# Left/Right move a column at a time.
+# Right selects the age column; > sorts by it (numbers by value). More
+# Right scrolls sideways, with the name column pinned.
 Right
 Sleep 900ms
+Type ">"
+Sleep 2s
 Right
-Sleep 900ms
+Sleep 700ms
 Right
-Sleep 1.2s
-Left
-Sleep 400ms
-Left
-Sleep 400ms
-Left
-Sleep 1s
+Sleep 700ms
+Right
+Sleep 1.5s
 
 # Back to the list, then a VCF: metadata as plain text, header pinned.
 Type "x"
@@ -63,17 +62,27 @@ Sleep 800ms
 Enter
 Sleep 2.5s
 PageDown
-Sleep 2s
+Sleep 1.5s
 
-# Find, then find again.
-Type "f"
-Sleep 500ms
+# & shows only matching lines; then sort them by QUAL, highest first.
+Type "&"
+Sleep 400ms
 Type "LowQual"
 Sleep 500ms
 Enter
-Sleep 1.8s
-Type "n"
-Sleep 1.8s
+Sleep 2s
+Right
+Sleep 300ms
+Right
+Sleep 300ms
+Right
+Sleep 300ms
+Right
+Sleep 300ms
+Right
+Sleep 800ms
+Type "<"
+Sleep 2.2s
 
 # Syntax highlighting, toggled with S; H shows a hex dump.
 Type "x"

@@ -137,7 +137,7 @@ mod tests {
         assert_eq!(w.count(), 6, "3 files, 3 directories, nothing hidden");
         assert_eq!(w.matching("md", 10), (vec!["README.md".to_string(), p("src/deep/er/Notes.md")], 2));
         assert_eq!(w.matching("SRC notes", 10).0, [p("src/deep/er/Notes.md")]);
-        assert_eq!(w.matching("deep", 1), (vec![p("src/deep/")], 3), "capped, with the full count");
+        assert_eq!(w.matching("deep", 1), (vec![format!("{}/", p("src/deep"))], 3), "capped, with the full count");
         assert_eq!(w.matching("", 100).1, 6);
 
         let all = Walk::start(&dir, true);

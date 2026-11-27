@@ -371,7 +371,7 @@ impl App {
     fn open_browser(&mut self) {
         let (dir, name) = match self.current_path() {
             Some(p) => {
-                let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                let p = crate::paths::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
                 (p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| ".".into()), name)
             }
@@ -658,7 +658,7 @@ impl App {
     fn copy(&mut self, path: bool) {
         if path {
             let Some(p) = self.current_path() else { return self.error("Standard input has no path to copy") };
-            let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string();
+            let p = crate::paths::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).display().to_string();
             self.flash(format!("Copied {p}"));
             self.clipboard = Some(p);
             return;
@@ -686,7 +686,7 @@ impl App {
         let mut v = vec!["FILE INFORMATION".to_string(), String::new()];
         let mut row = |k: &str, val: String| v.push(format!("  {k:<14}{val}"));
         row("Name", doc.name.clone());
-        let path = self.current_path().map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
+        let path = self.current_path().map(|p| crate::paths::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
         if let Some(p) = &path {
             row("Path", p.display().to_string());
             if let Ok(m) = std::fs::metadata(p) {

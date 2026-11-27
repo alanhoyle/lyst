@@ -33,7 +33,7 @@ fn command(path: &Path) -> Command {
 /// The launcher's output is discarded so it can't scribble over the screen.
 pub fn open(path: &Path) -> io::Result<()> {
     // An absolute path can't be mistaken for an option by the launcher.
-    let path = std::fs::canonicalize(path)?;
+    let path = crate::paths::canonicalize(path)?;
     // Some launchers (xdg-open) stay around a while; `launch` reaps them.
     launch(command(&path))
 }
@@ -54,7 +54,7 @@ fn launch(mut c: Command) -> io::Result<()> {
 
 /// Opens `path` in the default web browser (or `$BROWSER`) without waiting.
 pub fn open_in_browser(path: &Path) -> io::Result<()> {
-    let path = std::fs::canonicalize(path)?;
+    let path = crate::paths::canonicalize(path)?;
     let url = file_url(&path);
     if let Some(cmd) = browser_env(std::env::var("BROWSER").ok()) {
         return launch(shell_with_arg(&cmd, &url));

@@ -67,10 +67,10 @@ impl DirPrompt {
 
     /// Ctrl-W: deletes back to the previous `/`, or the `/` itself.
     pub fn delete_word(&mut self) {
-        if self.input.ends_with('/') {
+        if self.input.ends_with(is_sep) {
             self.input.pop();
         }
-        let keep = self.input.rfind('/').map_or(0, |i| i + 1);
+        let keep = self.input.rfind(is_sep).map_or(0, |i| i + 1);
         self.input.truncate(keep);
         self.refresh();
     }
@@ -121,6 +121,11 @@ impl DirPrompt {
     }
 }
 
+/// `/`, and on Windows also `\`.
+fn is_sep(c: char) -> bool {
+    c == '/' || (cfg!(windows) && c == '\\')
+}
+
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -140,7 +145,7 @@ fn suggestions(input: &str, base: &Path, show_hidden: bool) -> Vec<String> {
     if input == "~" {
         return vec!["~/".into()];
     }
-    let split = input.rfind('/').map_or(0, |i| i + 1);
+    let split = input.rfind(is_sep).map_or(0, |i| i + 1);
     let (dir, prefix) = input.split_at(split);
     let prefix = prefix.to_lowercase();
     let Ok(rd) = fs::read_dir(expand(dir, base)) else { return Vec::new() };

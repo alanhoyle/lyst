@@ -7,6 +7,7 @@ mod findfiles;
 mod goto;
 mod highlight;
 mod history;
+mod paths;
 mod preprocess;
 mod rows;
 mod search;

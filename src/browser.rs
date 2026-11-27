@@ -188,7 +188,7 @@ impl Browser {
     pub fn new(dir: &Path, classic: bool, prefs: Prefs) -> io::Result<Self> {
         let (w, h) = terminal::size().unwrap_or((80, 25));
         let mut b = Browser {
-            dir: fs::canonicalize(dir)?,
+            dir: crate::paths::canonicalize(dir)?,
             entries: Vec::new(),
             sel: 0,
             top: 0,
@@ -712,7 +712,7 @@ impl Browser {
 
     /// Shows a directory, or a file's directory with the file selected.
     fn go_to(&mut self, target: PathBuf) {
-        let path = match fs::canonicalize(&target) {
+        let path = match crate::paths::canonicalize(&target) {
             Ok(p) => p,
             Err(e) => return self.error(format!("{}: {e}", target.display())),
         };
@@ -1311,7 +1311,7 @@ mod tests {
         assert!(screen.contains("Go to directory: ") && screen.contains("alpha/beta/"), "{screen}");
         b.on_key(code(KeyCode::Enter));
         assert!(b.goto.is_none());
-        assert_eq!(b.dir, fs::canonicalize(dir.join("alpha/beta")).unwrap());
+        assert_eq!(b.dir, crate::paths::canonicalize(&dir.join("alpha/beta")).unwrap());
 
         // A file goes to its directory with the file selected; `q` is typed.
         b.on_key(key('j'));
@@ -1403,7 +1403,7 @@ mod tests {
         // Enter opens it; the results stay for when the viewer closes.
         assert!(matches!(code(&mut b, KeyCode::Enter), Action::Open));
         let (files, idx) = b.file_list();
-        assert_eq!(files[idx], dir.join("a/b/notes.md").canonicalize().unwrap());
+        assert_eq!(files[idx], crate::paths::canonicalize(&dir.join("a/b/notes.md")).unwrap());
         b.refresh();
         assert_eq!(b.entries.len(), 1);
 
@@ -1464,7 +1464,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lyst-browser-back-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("one/two")).unwrap();
-        let dir = dir.canonicalize().unwrap();
+        let dir = crate::paths::canonicalize(&dir).unwrap();
         let mut b = Browser::new(&dir, false, Prefs::new(false)).unwrap();
         press(&mut b, "-");
         assert!(b.message.as_ref().is_some_and(|(m, _)| m.contains("No previous")));

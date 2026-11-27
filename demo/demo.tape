@@ -102,6 +102,30 @@ Sleep 2.2s
 Type "H"
 Sleep 1s
 
+# An archive lists its contents; Enter views a file inside, X goes back.
+Type "x"
+Sleep 800ms
+Type "/project.tar."
+Sleep 800ms
+Enter
+Sleep 2.2s
+Down
+Sleep 300ms
+Down
+Sleep 300ms
+Down
+Sleep 300ms
+Down
+Sleep 300ms
+Down
+Sleep 300ms
+Down
+Sleep 900ms
+Enter
+Sleep 2.5s
+Type "x"
+Sleep 1.5s
+
 Type "q"
 Sleep 1s
 
